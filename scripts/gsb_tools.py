@@ -68,7 +68,7 @@ LOW_VALUE_PROCESS_NOISE_PATTERN = re.compile(
 )
 FIELD_FACTOR_RE = re.compile(
     r"(?:录屏|屏幕录制|录制过程|录制画面|录制结果|视频画面|视频中|视频里|视频显示|视频可见|视频证据|"
-    r"视频|截图|画面中|画面显示|画面可见|镜头|剪辑|剪掉|\bOtty\b|\biTerm2?\b|"
+    r"视频|截图|画面中|画面显示|画面可见|镜头|剪辑|剪掉|\bOtty\b|\biTerm2?\b|\bTerminal\.app\b|"
     r"1280\s*[x×]\s*720|720p|\bMP4\b|鼠标|光标|终端窗口|终端界面|命令行窗口|"
     r"浏览器|浏览器窗口|屏幕|测试设备|测试机|运行环境|运行机器|验收宿主|验收机|采集环境|采集设备|录制设备)",
     re.I,
@@ -106,6 +106,20 @@ REASON_MIN_SENTENCE_CHARS = 8
 REASON_CRITERION_PATTERN = re.compile(
     r"(?:看重|要紧|关键|决定|差别在|差距在|分开|分出|拉开|主要看|更在意|优先|首先要|最重要)"
 )
+# 2026-09-24 起：平台以“电报体”打回（八句一句一事实、句号密集、因果和扣分点靠读者自己排）。
+REASON_MAX_SENTENCES = 6
+REASON_MIN_LINK_WORDS = 2
+REASON_LINK_PATTERN = re.compile(
+    r"(?:因为|由于|所以|因而|于是|结果|导致|以致|使得|这样一来|这就|但是|但|不过|可是|却|而是|只要|一旦|否则|才)"
+)
+# 2026-09-25 起：为了避开“相邻句同称谓起头”，理由出现“检查……后，……”这类无主语句，
+# 读者分不清是哪一侧做的。打平统一写“Same”，但“选A”“选B”这类选项代号不进正文。
+REASON_SUBJECTLESS_OPENER = re.compile(
+    r"^(?:检查|核对|读取|阅读|查看|查阅|梳理|比对|运行|执行|调用|修改|编辑|调整|排查|定位|验证|构建|启动|安装|补充|补齐|新增|删除|实现)"
+)
+REASON_FORM_OPTION_PATTERN = re.compile(r"选\s*[AB](?![A-Za-z\s]*侧)")
+# “并发保存先提交标题未更新”一类：省掉主语和衔接，把两件事压成一个短语，要回读才懂。
+REASON_COMPRESSED_CLAUSE = re.compile(r"先[\u4e00-\u9fffA-Za-z0-9]{1,8}未[\u4e00-\u9fff]{1,6}")
 REASON_FLUENCY_PATTERNS = (
     ("重复标点", re.compile(r"[，。；：！？!?]{2,}")),
     ("重复虚词", re.compile(r"(?:的的|了了|是是|在在|和和|与与|就就|都都)")),
@@ -117,9 +131,10 @@ REASON_FLUENCY_PATTERNS = (
         ),
     ),
     (
+        # “都成功了。”“出错了。”是口语复盘最自然的收尾，不算残句（2026-09-25）。
         "残句结尾",
         re.compile(
-            r"(?:的|了|和|与|及|而|但|因为|由于|如果|当|在|从|对|把|被|为|是|就|都|还|也|很|更|最|可以|能够|需要|应该|必须)[。！？!?]$"
+            r"(?:的|和|与|及|而|但|因为|由于|如果|当|在|从|对|把|被|为|是|就|都|还|也|很|更|最|可以|能够|需要|应该|必须)[。！？!?]$"
         ),
     ),
 )
@@ -191,11 +206,6 @@ def reason_style_warnings(reason: str) -> list[str]:
             "GSB 理由出现“真实”“真正”“其实”等空泛表达；请改成能核对的动作、状态或结果: "
             + "、".join(dict.fromkeys(vague))
         )
-    if text_non_whitespace_len(reason) >= 150 and not REASON_CRITERION_PATTERN.search(reason):
-        warnings.append(
-            "GSB 理由只罗列事实，没有交代最看重哪一条；结尾前用一句话点明判断依据，"
-            "例如“这题最要紧的是并发保存不丢数据”"
-        )
     return warnings
 
 
@@ -213,6 +223,20 @@ def reason_flow_errors(reason: str) -> list[str]:
             )
             break
         previous = label
+    for index, sentence in enumerate(sentences, 1):
+        opener = REASON_SUBJECTLESS_OPENER.match(sentence)
+        if opener:
+            errors.append(
+                f"GSB 理由第 {index} 句以“{opener.group(0)}”起头，没有交代是哪一侧做的，"
+                "读者会把它算到上一侧；换侧时句首写明称谓，同一侧接着说用“随后”“它”承接"
+            )
+            break
+    form_option = REASON_FORM_OPTION_PATTERN.search(reason)
+    if form_option:
+        errors.append(
+            f"GSB 理由把表单选项“{form_option.group(0)}”写进了正文；结论用中文说，"
+            "例如“因此选择Same”“因此选择 B 侧方案”"
+        )
     for label in REASON_LABELS:
         count = reason.count(label)
         if count > REASON_MAX_LABEL_MENTIONS:
@@ -226,6 +250,29 @@ def reason_flow_errors(reason: str) -> list[str]:
             errors.append(
                 f"GSB 理由第 {index} 句只有 {len(clean)} 字，像补在末尾的碎句：{clean}；并入前后句"
             )
+    if len(sentences) > REASON_MAX_SENTENCES:
+        errors.append(
+            f"GSB 理由共 {len(sentences)} 句，超过 {REASON_MAX_SENTENCES} 句，句号过密像电报体；"
+            "同一侧的动作和结果用逗号连成一句，交代清谁因谁果"
+        )
+    body = "".join(sentences[:-1]) if len(sentences) > 1 else reason
+    links = REASON_LINK_PATTERN.findall(body)
+    if len(links) < REASON_MIN_LINK_WORDS:
+        errors.append(
+            f"GSB 理由结论句之前只有 {len(links)} 处因果或转折衔接，读者要自己排谁因谁果；"
+            "负面事实用“结果”“导致”“所以”接上后果，两侧对照用“但”“不过”“却”"
+        )
+    compressed = REASON_COMPRESSED_CLAUSE.search(reason)
+    if compressed:
+        errors.append(
+            f"GSB 理由把两件事压成了一个短语：{compressed.group(0)}；补上主语和衔接，"
+            "例如“两个人同时保存时，先提交的一方写进去了，标题却没有更新”"
+        )
+    if text_non_whitespace_len(reason) >= 150 and not REASON_CRITERION_PATTERN.search(reason):
+        errors.append(
+            "GSB 理由只罗列事实，没有交代哪一条是扣分点、最看重什么；结论前用一句话点明，"
+            "例如“这个任务最重要的是并发保存不丢数据”"
+        )
     return errors
 
 
@@ -540,7 +587,15 @@ def _shingles(value: str, size: int = 12) -> set[str]:
     return {clean[index : index + size] for index in range(max(0, len(clean) - size + 1))}
 
 
-def fetch_reason_history() -> list[str]:
+def fetch_reason_history(task_root: Path | None = None) -> list[str]:
+    current_sessions: set[str] = set()
+    if task_root is not None:
+        state = read_json(task_root / "monitor" / "state.json", {})
+        sides = state.get("sides") or {}
+        current_sessions = {
+            str((sides.get(side) or {}).get("sessionId") or "").strip()
+            for side in ("A", "B")
+        } - {""}
     try:
         payload = _request_json("/api/v1/gsb/submissions?page=1&size=200")
     except SologsbError as exc:
@@ -554,6 +609,12 @@ def fetch_reason_history() -> list[str]:
     if isinstance(records, list):
         for item in records:
             if isinstance(item, dict):
+                sessions = {
+                    str(item.get("a_session_id") or item.get("aSessionId") or "").strip(),
+                    str(item.get("b_session_id") or item.get("bSessionId") or "").strip(),
+                } - {""}
+                if current_sessions and sessions & current_sessions:
+                    continue
                 value = item.get("gsb_reason") or item.get("reason")
                 if value:
                     reasons.append(str(value))
@@ -584,7 +645,7 @@ def _validate_reason_dedup(reason: str, task_root: Path | None = None) -> list[s
         return []
     errors: list[str] = []
     clean = _normalize(reason)
-    for index, historical in enumerate(fetch_reason_history(), 1):
+    for index, historical in enumerate(fetch_reason_history(task_root), 1):
         other = _normalize(historical)
         if clean == other:
             errors.append(f"GSB 理由与已有数据第 {index} 条精确重复")
@@ -1198,7 +1259,7 @@ def validate_draft(draft: dict[str, Any], task_root: Path, *, review_path: Path)
             errors.append(f"GSB 理由必须使用完整表述“{full_label}”，禁止省略式单字")
         if not re.search(rf"\b{side}\b|[（(]{side}[）)]|{side}侧|{side}的表现|{side}跑", reason):
             errors.append(f"GSB 理由没有明确覆盖 {side}")
-    if verdict == "Same" and not re.search(r"等价|抵消|持平|无明显差异|难分高下", reason):
+    if verdict == "Same" and not re.search(r"Same|等价|抵消|持平|无明显差异|难分高下", reason):
         errors.append("Same 必须写明等价点和相互抵消项")
     errors.extend(_validate_reason_layer_coverage(draft, reason))
     errors.extend(_validate_sentence_evidence(reason, draft, evidence_doc))
@@ -1456,7 +1517,7 @@ def write_field_guide(task_root: Path, schema: dict[str, Any], values: dict[str,
         if field.get("field_type") in {"attachment", "video"}:
             value = f"{value}<br>提交：`submit_api.py` 会上传文件，再把平台返回的对象地址写入 API payload；Excel 仍保留本地绝对路径。"
         if key in {"a_screencast", "b_screencast"}:
-            value = f"{value}<br>视频规格：1280x720（720p），单段不超过 90 秒；Web 仅 Otty+Chrome，终端/失败仅 Otty。"
+            value = f"{value}<br>视频规格：1280x720（720p），单段不超过 90 秒；Web 仅 Terminal.app+Chrome，终端/失败仅 Terminal.app。"
         lines.append(
             f"| {index} | {field.get('group', '')} | `{key}` / {field.get('label', '')} | "
             f"{field.get('field_type', '')} | {required} | {value} |"
@@ -1473,7 +1534,7 @@ def write_field_guide(task_root: Path, schema: dict[str, Any], values: dict[str,
             "- GSB 理由必须严格使用纯文本，不允许任何 Markdown 语法；标题、列表、代码块、行内代码、链接、图片、强调标记、表格、引用和 HTML 标签全部阻断。",
             "- 过程层写轨迹中的实际动作和定位节点，例如读取、检查、修改、执行、排查或返工了哪一步、文件、命令或需求；不能只写“进行了测试”或“做了迁移”。",
             "- 产物层写最终可观察结果，例如接口返回、缺少字段、未实现需求、构建启动结果或真实失败；不得只写交付物毛病。",
-            "- 录屏、视频、截图、浏览器、测试设备、运行环境、验收宿主、Otty、鼠标、分辨率等场外因素不得写进 GSB 理由，没有例外。",
+            "- 录屏、视频、截图、浏览器、测试设备、运行环境、验收宿主、Otty、Terminal.app、鼠标、分辨率等场外因素不得写进 GSB 理由，没有例外。",
             "- evaluationExcluded 的环境或工具噪声证据不得被 claim、sentenceEvidence 或理由正文引用；其他噪声也不能成为独立评分项或 A/B 胜负依据。",
             "- 用于支撑每侧过程/产物的 claim.text 必须原样出现在 GSB 理由中。",
             "- 每条负面 claim 必须提供 triggerKind/trigger；触发节点只允许步骤、文件、命令或需求，并原样写入 GSB 理由。",
@@ -1488,8 +1549,10 @@ def write_field_guide(task_root: Path, schema: dict[str, Any], values: dict[str,
             "- 有页面的项目和之前一样引用录屏证据；纯后端 API 项目录屏不引用，用验证计划的 probe 接口探活证明问题。",
             "- 描述与理由都直接写“请求了登录接口，返回404”，不写“从录屏来看”“根据编写的测试”“复核结果显示”。",
             "- GSB 理由使用完整、质朴的中文描述，统一写“A 侧方案”“B 侧方案”，不使用省略式单字；每侧称谓最多出现 3 次，相邻两句不要用同一称谓起头，不写 8 字以下的碎句。",
-            "- 结尾前用一句话交代这题最看重哪一条，再给结论；不要只罗列事实后直接宣布胜负。",
-            "- 禁用“闭环”“根因”“落库”；数据写入统一写“入库”；常用命令“npm run build”统一写“build”，避免历史长片段去重；“真实”“真正”“其实”等空泛表达会给出警告。",
+            "- 不写电报体：全文最多 6 句，同一侧的动作和结果用逗号连成一句；结论句之前至少 2 处“结果”“导致”“但”“却”这类因果或转折衔接，让读者一眼看出谁因谁果、哪条是扣分点。",
+            "- 不把两件事压成“先提交标题未更新”这类短语，补上主语和衔接，写成“先提交的一方写进去了，标题却没有更新”。",
+            "- 结尾前用一句话交代这个任务最重要的是哪一条，再给结论；不要只罗列事实后直接宣布胜负。",
+            "- 禁用“闭环”“根因”“落库”，也禁用旧句式“这题”“最要紧”，统一写“这个任务最重要的是”；数据写入统一写“入库”；常用命令“npm run build”统一写“build”，避免历史长片段去重；“真实”“真正”“其实”等空泛表达会给出警告。",
             "- 句子达到高中语文阅读水平，表达通顺；单句非空白字符不得超过 56 字，分句和标点异常会阻断。",
             "- 禁止使用“落在……”式收束句式；结论直接写“因此选择 B 侧方案”或“B 侧方案更好”。",
         ]

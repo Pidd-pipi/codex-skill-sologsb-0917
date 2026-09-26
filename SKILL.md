@@ -20,11 +20,11 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
 
 ## Git 版本信息
 
-- 仓库：https://github.com/kekelele996/codex-skill-sologsb-0917
+- 仓库：https://github.com/Pidd-pipi/codex-skill-sologsb-0917
 - 跟踪分支：`main`
-- 全局版本号：`1.3.0`（语义化版本，整个技能统一只用这一个版本号）
-- 发布标签：`v1.3.0`
-- 精确提交号：运行 `git rev-parse v1.3.0` 获取。
+- 全局版本号：`1.4.0`（语义化版本，整个技能统一只用这一个版本号）
+- 发布标签：`v1.4.0`
+- 精确提交号：运行 `git rev-parse v1.4.0` 获取。
 - 机器可读版本：技能根目录的 `VERSION` 文件，是全局版本号的唯一来源；
   命令行用 `python3 scripts/sologsb.py --version` 或 `python3 scripts/sologsb.py version` 读取。
 - 改版本时只改 `VERSION` 的 `version` 与 `release_tag` 两行，再同步本节文字，
@@ -43,8 +43,9 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
 - 网关 429 `max_parallel_requests` 属于准入失败：正式候选运行前先等待最小 `/v1/messages` 探测成功；发生最终 429 后不要立即重启新容器，先等待 Key 恢复。恢复后仍按红线使用新容器、新 Claude home 和新 SessionID，实际尝试次数照记。
 - pnpm fresh clone 固定按“安装失败留证 → `pnpm approve-builds --all` → 再次安装 → 构建”顺序处理。
 - Web 录屏先确认默认 Tab、当前用户和重复卡片选择器；同名操作按钮使用卡片范围或 `.last()`；同时清除 Chrome 登录/同步/密码/通知等浮层与终端多网卡干扰行。
-- 录屏必须使用窗口级后台模式：先用 Quartz 定位 Otty/Chrome 的数字 `CGWindowID`，再调用 ScreenCaptureKit 的 `SCContentFilter(desktopIndependentWindow:)` 和 `SCRecordingOutput` 采集；必须设置 `showsCursor=false`、`showMouseClicks=false`、`capturesAudio=false`。全程不激活、不置前、不最小化录制窗口。开录瞬间必须复核窗口仍在当前 Space 且 `ownerPid + ownerName` 未变化，找不到就停机。
-- 具体踩坑记录见 `references/lessons-learned-20260917.md`。
+- 录屏画面内容红线：终端不得展示凭据、`.env`、环境变量或任务目录外文件，Chrome 只访问本地被测应用；原生弹窗（alert/confirm、文件选择、原生下拉、右键菜单）拍不到，关键验收步骤不得依赖它们，详见 `references/recording.md`「画面内容约束」。
+- 录屏必须使用窗口级后台模式：先用 Quartz 定位 Terminal.app/Chrome 的数字 `CGWindowID`，再调用 ScreenCaptureKit 的 `SCContentFilter(desktopIndependentWindow:)` 和 `SCRecordingOutput` 采集；必须设置 `showsCursor=false`、`showMouseClicks=false`、`capturesAudio=false`。全程不激活、不置前、不最小化录制窗口。开录瞬间必须复核窗口仍在当前 Space 且 `ownerPid + ownerName` 未变化，找不到就停机。
+- 具体踩坑记录见 `references/lessons-learned-20260917.md` 与 `references/lessons-learned-20260925-terminal-app.md`（切换 Terminal.app）。
 
 ## 固定红线
 
@@ -66,8 +67,8 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
   不等待它们完成。
 - 候选阶段绝不创建 GitHub 仓库、绝不 push。重复启动同一任务根时，`run_candidates` 会先只读探测候选任务锁，占用就直接退出，不再清空状态或重建正在使用的工作区；`_clone_candidate` 也不会删除仍被运行中容器挂载的目录。
 - GitHub 仓库名必须以平台项目标识开头，再跟 3–6 位小写字母数字唯一后缀，例如 `cy-291-a1b2`；平台项目拿不到 `projectCode` 时禁止创建仓库。
-- GitHub 网络红线：所有 GitHub 网络访问，包括 `gh api`、`gh repo view/create/delete`、`git clone/fetch/push/ls-remote`，必须经 Loon 代理。优先使用显式 `SOLOSB_GITHUB_PROXY`，否则自动探测 HTTP `127.0.0.1:17890`，再探测 SOCKS5 `127.0.0.1:17891`；两者不可用时停止作业，禁止裸网直连。
-- Loon 端口都不可达或经代理仍出现 TLS/SSL 故障时，保留真实错误并按基础设施门禁停止，不得反复创建候选仓库。
+- GitHub 网络红线：所有 GitHub 网络访问，包括 `gh api`、`gh repo view/create/delete`、`git clone/fetch/push/ls-remote`，必须经 Clash Verge 混合代理。默认地址为 `127.0.0.1:7897`；优先使用显式 `SOLOSB_GITHUB_PROXY`（支持裸端口 `7897`、`host:port` 或完整 URL），代理不可用时停止作业，禁止裸网直连。
+- Clash Verge 混合代理不可达或经代理仍出现 TLS/SSL 故障时，保留真实错误并按基础设施门禁停止，不得反复创建候选仓库。
 - A/B 映射完成后才允许 `github-init` 以原始源码创建 `main/A/B`；A/B 产物先停在 staged，必须两侧都通过语义完成审核，
   才允许通过原子 push 同时发布 A、B。
 - A、B 产物 commit 的父提交必须严格等于初始环境快照；A/B 只是候选映射后的逻辑代号。
@@ -85,13 +86,13 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
   若视频显示不可启动、页面崩溃或需求未完成，结论不得写成成功，必须修正评分与 GSB 后再交付。
 - 录屏 `ok` 不能只看文件是否生成：`expectedAppFailure=false` 而浏览器/API 非零退出时必须写 `ok=false`、`observedAppFailure=true`，
   `record` 命令返回非零并把状态退回 `gsb_ready`；先归档失败片段，修正 scenario 或应用后重录，未通过前不得进入 `recorded/complete`。
-- 录屏窗口 ID 红线：任何必须录屏的步骤只能使用 `window-id`。Web 题必须分别打开或定位 Otty 与 Chrome 窗口，并记录各自 `windowId`；API/CLI/失败题必须定位 Otty 窗口 ID。窗口缺失时先打开，无法定位或 `windowId<=0` 时立即停止，禁止回退到整屏、裁切、iTerm2 或 headless。
+- 录屏窗口 ID 红线：任何必须录屏的步骤只能使用 `window-id`。Web 题必须分别打开或定位 Terminal.app 与 Chrome 窗口，并记录各自 `windowId`；API/CLI/失败题必须定位 Terminal.app 窗口 ID。窗口缺失时先打开，无法定位或 `windowId<=0` 时立即停止，禁止回退到整屏、裁切、iTerm2 或 headless。
 - 每个片段必须写 `<片段>-window-capture.json`，其中必须包含 `captureKind=window-id`、`captureBackend=screen-capture-kit`、`showsCursor=false`、`cursorCaptured=false`、目标 `windowId`、所属 PID、bounds、退出码和采集状态；窗口 ID 缺失、失效、后端不是 ScreenCaptureKit、鼠标排除标记不为 false 或采集状态非 `ok` 时该侧录屏失败。
-- 开录瞬间必须再次确认目标窗口仍在当前 Space、未被最小化，且 `ownerPid + ownerName` 与定位时一致；窗口不在 Otty/Google Chrome 白名单内时立即停机。
+- 开录瞬间必须再次确认目标窗口仍在当前 Space、未被最小化，且 `ownerPid + ownerName` 与定位时一致；窗口不在 Terminal.app（本地化名如“终端”，按 bundle id `com.apple.Terminal` 判定）/Google Chrome 白名单内时立即停机。
 - ChatGPT 不属于录制目标。录制器不得最小化、激活、移动或恢复任何 ChatGPT 窗口，也不生成
-  `chatgpt-window-guard.json`；窗口级后台采集只处理 Otty/Google Chrome。
+  `chatgpt-window-guard.json`；窗口级后台采集只处理 Terminal.app/Google Chrome。
 - 开窗可能短暂把录制窗口置前；仅当最前普通窗口属于本次录制进程时，才把用户原前台应用恢复，并写入
-  `recordingMetadata.userFrontmostAppAtStart` 与 `recordingMetadata.focusRestores`。不得调用 `window focus` 或定时 `bringToFront`。
+  `recordingMetadata.userFrontmostAppAtStart` 与 `recordingMetadata.focusRestores`。不得调用 `window focus`、`activate` 或定时 `bringToFront`，也不再打开任何“锚点/guard”辅助终端窗口。
   发生焦点抢占时必须确认用户原应用重新成为最前应用并写 `focusRestoreOk=true`。
 - 指针策略固定使用 `pointerStrategy=none`（`pointerPolicy=host-input-untouched`）。录制器不得移动、停靠、恢复或读取鼠标按键，不得调用任何会改变用户鼠标位置的接口；旧计划中的 `background`、`park-pointer` 必须自动归一到 `none`。
 - 每个片段旁仍写纯 JSON `<片段>-cursor-guard.json`，至少包含 `segment`、数字 `windowId`、
@@ -100,15 +101,15 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
   验收要求 `status=ok`、`pointerStrategy=none`、`pointerPolicy=host-input-untouched`、`hostInputRespected=true`、`pointerMoved=false`、`mouseButtonsQueried=false`、`parkApplied=false`；指针是否位于窗口内不影响录制，画面出现指针也不得要求重录。
 - Web 题在 Chrome 驱动中设置 `HUMAN_BROWSER_KEEP_FRONT=0`，并给 Chrome 加
   `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling`。
-- Web 录制收尾必须用 `otty pane capture --pane <id> --lines 400` 写真实 `terminal.log`，不能用空文件占位。
+- Web 录制收尾必须读取录制窗口 `history of tab 1` 写真实 `terminal.log`，不能用空文件占位。
 - 录制期间每秒采样最前普通窗口，`recordingWindowFrontmostSamples` 必须为 0；采样报告写
   `frontmost-window-monitor.json`。
 - 收尾必须执行 `cleanupCommands`，且只终止本次录制新起的应用端口监听进程；残留写
   `service-cleanup.json.residualAppPortListeners`，非空时 `ok=false`。临时 `chrome-profile` 默认删除。
-- 录屏默认使用 Otty CLI，统一输出 1280x720（720p）。最终画面只允许出现
-  Otty 和浏览器：Web 题两者必须都有，API/CLI/失败题只允许 Otty。默认值必须为 Otty；Web 题按窗口 ID
-  录制仅支持 Otty，禁止出现桌面应用、IDE、Finder、系统设置、Dock 或其他应用。无法启动时也必须保留真实失败过程。
-- 纯后端/API 题必须使用 `mode=terminal`（仅 Otty），并在 `record-plan.json.apiRequests` 中配置真实请求
+- 录屏终端固定使用 macOS 原生 Terminal.app（`terminalApp=terminal`；旧计划的 `otty` 自动归一），统一输出 1280x720（720p）。最终画面只允许出现
+  Terminal.app 和浏览器：Web 题两者必须都有，API/CLI/失败题只允许 Terminal.app。每侧只开一个录制终端窗口，
+  禁止出现桌面应用、IDE、Finder、系统设置、Dock 或其他应用，禁止改用 Otty/iTerm2。无法启动时也必须保留真实失败过程。
+- 纯后端/API 题必须使用 `mode=terminal`（仅 Terminal.app），并在 `record-plan.json.apiRequests` 中配置真实请求
   （方法、完整 URL、请求头、请求体、期望状态码、关键响应字段）；录屏必须展示真实请求与响应，
   不得只录启动日志或用 headless 脚本代替。
 - 平台项目并发安全：`init --from-platform` 必须先获取按 Manager 地址隔离的全局选择锁，
@@ -134,7 +135,7 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
   不能替代轨迹校验、语义完成审核或产物证据。
 - 2026-09-23 官方表单（fingerprint `954e9db2d25afeb4`，23 个字段全部必填）删除了“备注”，新增 `A/B-交付完整性`（1~5 整数）和 `A/B-交付完整性描述`。草稿必须提供 `delivery.A/B.score/description/evidenceIds`，打分与写法见 `references/delivery-scoring.md`：只写完整性，两侧独立撰写，允许与 GSB 理由少量重合但不得照抄，A、B 两段之间和与历史数据之间都按 G12 查重。
 - 红线：A/B 交付完整性描述必须与本侧轨迹对应，不得出现对立意见。锚点必须在本侧原始轨迹中存在，分数和描述不得与本侧真实复核结果、引用证据、GSB 理由或 GSB 结论相反（详见 `references/delivery-scoring.md` 红线一）。本地（容器外）编写的任何测试和自动化脚本，包括验收、冒烟、Playwright、录制场景，都不参与交付完整性描述：不写进描述，不引用其证据，也不作为分数依据（红线二）。有页面的项目和之前一样引用录屏证据；纯后端 API 项目的录屏排除，改用验证计划的 `probe` 接口探活作为证据。描述和理由都直接写“请求了登录接口，返回404”这种主观直述，不写“从录屏来看”“根据编写的测试”。
-- GSB 理由与题目提示词都要写得像人话：理由按“一侧一段话”组织，相邻句不用同一称谓起头、每侧称谓最多 3 次、结尾前交代判准；提示词像业务方交代需求，硬性措辞最多 3 处、分号最多 2 个，不用“刷新后……一致”式模板收尾。
+- GSB 理由与题目提示词都要写得像人话：理由按“一侧一段话”组织，相邻句不用同一称谓起头、每侧称谓最多 3 次；不写电报体，全文最多 6 句，结论前至少 2 处“结果”“导致”“但”“却”这类因果或转折衔接，不把两件事压成“先提交标题未更新”式短语，结论前必须点明判准和扣分点（2026-09-24 电报体打回后改为阻断）；句子不能以“检查”“核对”等动作直接起头而没有交代是哪一侧，两侧打平时结论统一写“因此选择Same”，不写“打平”，也不写“选A”“选B”（2026-09-25）；提示词像业务方交代需求，硬性措辞最多 3 处、分号最多 2 个，不用“刷新后……一致”式模板收尾。
 - 提交前必须逐份读取 A/B 轨迹 JSONL，确认内容实际包含 SessionID，且与状态、Excel 中的对应 SessionID 完全一致；缺失或不一致直接阻断。
 - 提交前必须从只读接口刷新历史 GSB 记录，将完整 `user_prompt` 与 `gsb_reason` 写入本地持久缓存 `$CODEX_HOME/cache/sologsb-0917/gsb-history-cache.json`，并按当前 A/B SessionID/已提交 ID 排除自身。历史文案缓存不可只保存在单个任务目录。
 - 当前 `GSB 理由` 必须与历史 `gsb_reason` 逐条执行 B-5 公共长片段、模板 n-gram 和相似度检测；低整句相似度但存在公共长片段同样阻断。任何 `EXACT`、`SIMILAR`、`REVIEW_REQUIRED` 或 `MISSING` 都不得上传或提交。
@@ -142,14 +143,14 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
 - 命中历史理由后，必须回到本次和对应历史记录的轨迹、commit、构建/测试/启动输出重写对比理由；禁止只替换项目名、保留公共句式或套用统一模板。
 - GSB 理由使用完整、质朴的中文描述，不使用省略式单字；统一写“A 侧方案”“B 侧方案”，业务名词写完整。禁止使用“落在……”式收束句式，结论直接写“因此选择 B 侧方案”或“B 侧方案更好”。
 - GSB 理由必须严格使用纯文本，不允许任何 Markdown 语法；标题、列表、代码块、行内代码、链接、图片、强调标记、表格、引用和 HTML 标签均由 `gsb_tools.py` 硬阻断。
-- GSB 理由禁用“闭环”“根因”“落库”，数据写入统一写“入库”；常用命令“npm run build”统一写“build”，避免触发历史公共长片段。“真实”“真正”“其实”等空泛表达会给出警告。数字两侧不留空格，写“计数从2变22”。文风要朴实但不要过于干练：动词后补足语气与结果（“建了独立表”“覆盖掉了”“还是照旧读回”），禁止电报式短句。
+- GSB 理由禁用“闭环”“根因”“落库”，也禁用旧句式“这题”“最要紧”，统一写“这个任务最重要的是”；数据写入统一写“入库”；常用命令“npm run build”统一写“build”，避免触发历史公共长片段。“真实”“真正”“其实”等空泛表达会给出警告。数字两侧不留空格，写“计数从2变22”。文风要朴实但不要过于干练：动词后补足语气与结果（“建了独立表”“覆盖掉了”“还是照旧读回”），禁止电报式短句。
 - GSB 理由必须达到高中语文阅读水平，句子通顺；单句非空白字符不得超过 56 字，分句过多、重复标点、标点不成对、连接词堆叠、重复虚词和残句均阻断。
 - 禁止用中文念法或缩写代称提交号，例如“依六四二四七二c”；引用原有业务值或代码值即可。
 - 负面触发节点不能只写“首次运行阶段”这类泛化阶段，必须落到具体页面、入口、接口、文件、命令或报错原文，例如“打开专栏详情页时”“调用我的订阅接口返回401”。
 - 禁止把并发现象压成名词串或读数排列；按“触发动作、现场现象、客观后果”展开成完整短句，让读者能从业务过程读懂胜负原因。
 - GSB 理由必须同时覆盖 A、B 各自的过程与产物：每侧至少有一条过程 claim 和一条产物 claim，`claim.text` 原样写入理由。不能只写一侧过程、另一侧产物，也不能整段只写交付物毛病。
 - 过程层必须写原生轨迹可核对的执行事实：在哪个步骤、文件、命令或需求触发，读取、检查、修改、执行了什么，是否返工、发现或修正问题；不能只写“进行了测试”“做了迁移”“改过代码”这类空泛动作。
-- 产物层必须写最终可观察结果：功能、交互、数据、接口、性能、兼容性、可运行性、需求覆盖或真实失败结果。不得用录屏、视频、截图、浏览器、测试设备、运行环境、验收宿主、Otty、鼠标、分辨率、终端窗口等场外因素评价好坏；这些不能进入 GSB 理由，没有例外。
+- 产物层必须写最终可观察结果：功能、交互、数据、接口、性能、兼容性、可运行性、需求覆盖或真实失败结果。不得用录屏、视频、截图、浏览器、测试设备、运行环境、验收宿主、Otty、Terminal.app、鼠标、分辨率、终端窗口等场外因素评价好坏；这些不能进入 GSB 理由，没有例外。
 - 禁止在 GSB 理由中引用 `evaluationExcluded` 的环境或工具噪声证据；这类证据也不能作为独立 claim、评分或胜负依据。
 - GSB 理由不堆测试或断言数量，改成“后端关键路径完整覆盖”“完整接口流程验证”等业务覆盖描述；`gsb_tools.py` 会直接阻断计数式写法。
 - 低价值环境/工具噪声不直接参与 GSB 评定：解释器或命令未找到、测试 PYTHONPATH 缺失、编辑工具替换文本未匹配、临时工作目录、重跑等，不能作为独立 claim、评分项或胜负依据。标记为 `evaluationExcluded` 的证据不得进入 GSB 理由正文。
@@ -163,9 +164,10 @@ Git commit 和真实复核命令；不得用模型最终回复代替证据。
 
 - Claude API Key 与 LLM Base URL
 - 最大并发容器 `claude.maxContainers`（默认 4，绝对上限 6）
+- 容器镜像 `claude.image`（默认 `adminfather/benzhi-claude-code2:20260919`：原生镜像，只带 Node 20 / Python 3.11（无 pip）/ git / Claude Code 2.1.197，不含 Go、JDK、Maven、Gradle、pnpm，也不含 docker；运行器以 `--entrypoint /bin/bash` 启动并显式传入 Base URL，不依赖镜像自带的 entrypoint 与 `ANTHROPIC_BASE_URL`）
 - Solo Manager 地址、账号、密码
 - SOLO2 地址、账号、密码
-- GitHub Token 与 Loon 代理
+- GitHub Token 与 Clash Verge 混合代理（默认 `127.0.0.1:7897`）
 
 技能入口启动时会自动把它注入环境变量，一般配置优先级为
 `命令行参数 > 环境变量 > 配置文件 > 代码默认值`；磁盘上不存在该文件时，
@@ -220,8 +222,8 @@ SOLO2 会话失效时，运行器会用配置里的账号密码自动重新登�
    该命令会同时把草稿写到提交预检固定读取的 `monitor/gsb-draft.json`，录屏后刷新 Excel 也会保持同步。
 9. 为 A、B 分别生成录屏计划和 scenario，再运行 `record --side A/B --plan ...`。
    命令会在锁内执行预检/预构建、环境检查、真实录屏和收尾；另一项目持锁时当前任务等待而不是并发启动。
-   默认使用 Otty；终端只显示相对路径，不暴露真实绝对路径。录制固定当前 Space，不切换 Space；
-   不对 ChatGPT 做任何窗口操作；先定位或打开 Otty/Chrome 窗口并取得数字 `CGWindowID`，开录瞬间复核后只用
+   默认使用 Terminal.app（后台启动、单窗口、`zsh -f` 干净 shell）；终端只显示相对路径，不暴露真实绝对路径。录制固定当前 Space，不切换 Space；
+   不对 ChatGPT 做任何窗口操作；先在后台打开 Terminal.app/Chrome 窗口并取得数字 `CGWindowID`，开录瞬间复核后只用
    ScreenCaptureKit 按窗口 ID 后台采集，不激活录制窗口。若开窗短暂抢到前台，只把用户原应用恢复；默认
    `pointerStrategy=none`，全程不操作鼠标，并强制 `showsCursor=false`，用户仍可正常操作鼠标。结束后检查前台采样、焦点恢复和服务清理。
    视频统一保存为 `<项目编号-项目名>-验证A产物.mp4` 和 `<项目编号-项目名>-验证B产物.mp4`。

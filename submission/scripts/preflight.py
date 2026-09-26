@@ -17,6 +17,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 import sys
 import unicodedata
 import urllib.error
@@ -93,7 +94,7 @@ ARTIFACT_OUTCOME_RE = re.compile(
 )
 FIELD_FACTOR_RE = re.compile(
     r"(?:录屏|屏幕录制|录制过程|录制画面|录制结果|视频画面|视频中|视频里|视频显示|视频可见|视频证据|"
-    r"视频|截图|画面中|画面显示|画面可见|镜头|剪辑|剪掉|\bOtty\b|\biTerm2?\b|"
+    r"视频|截图|画面中|画面显示|画面可见|镜头|剪辑|剪掉|\bOtty\b|\biTerm2?\b|\bTerminal\.app\b|"
     r"1280\s*[x×]\s*720|720p|\bMP4\b|鼠标|光标|终端窗口|终端界面|命令行窗口|"
     r"浏览器|浏览器窗口|屏幕|测试设备|测试机|运行环境|运行机器|验收宿主|验收机|采集环境|采集设备|录制设备)",
     re.I,
@@ -135,6 +136,10 @@ GENERATED_DIR_NAMES = {
 }
 
 
+DEFAULT_GITHUB_PROXY_HOST = "127.0.0.1"
+DEFAULT_GITHUB_PROXY_PORT = 7897
+
+
 def _proxy_port_open(host: str, port: int, timeout: float = 0.25) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -143,22 +148,33 @@ def _proxy_port_open(host: str, port: int, timeout: float = 0.25) -> bool:
         return False
 
 
+def _normalize_proxy_url(value: str, *, default_scheme: str = "http") -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        if text.isdigit():
+            text = f"{DEFAULT_GITHUB_PROXY_HOST}:{text}"
+        text = f"{default_scheme}://{text}"
+    return text
+
+
 def github_env(extra: dict[str, str] | None = None, *, require_proxy: bool = False) -> dict[str, str]:
-    """Apply the local Loon proxy to GitHub CLI and Git network commands."""
+    """Apply the local Clash Verge mixed proxy to GitHub CLI and Git commands."""
     env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
     proxy = (
         os.environ.get("SOLOSB_GITHUB_PROXY", "").strip()
         or os.environ.get("GITHUB_PROXY", "").strip()
     )
-    if not proxy:
-        if _proxy_port_open("127.0.0.1", 17890):
-            proxy = "http://127.0.0.1:17890"
-        elif _proxy_port_open("127.0.0.1", 17891):
-            proxy = "socks5h://127.0.0.1:17891"
+    if proxy:
+        proxy = _normalize_proxy_url(proxy)
+    elif _proxy_port_open(DEFAULT_GITHUB_PROXY_HOST, DEFAULT_GITHUB_PROXY_PORT):
+        proxy = f"http://{DEFAULT_GITHUB_PROXY_HOST}:{DEFAULT_GITHUB_PROXY_PORT}"
     if not proxy and require_proxy:
         raise RuntimeError(
-            "Loon GitHub 代理不可用：请设置 SOLOSB_GITHUB_PROXY，"
-            "或启动 HTTP 127.0.0.1:17890 / SOCKS5 127.0.0.1:17891"
+            "Clash Verge GitHub 代理不可用：请设置 SOLOSB_GITHUB_PROXY，"
+            f"或启动混合代理 {DEFAULT_GITHUB_PROXY_HOST}:{DEFAULT_GITHUB_PROXY_PORT}"
         )
     if proxy:
         env["HTTPS_PROXY"] = proxy
@@ -425,8 +441,20 @@ def _readonly_json(path: str, *, timeout: int = 60) -> dict:
                 "User-Agent": "gsb-submit-preflight/1.0",
             },
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8") or "{}")
+        last_error: Exception | None = None
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return json.loads(response.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt < 4:
+                    time.sleep(0.5 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("只读请求失败")
 
     service = os.environ.get("SOLOSB_SOLO2_KEYCHAIN_SERVICE", "").strip()
     cookie = os.environ.get("SOLO_QA_COOKIE", "").strip() or (
@@ -1632,7 +1660,11 @@ def main() -> int:
     for side in ("A", "B"):
         video_path = Path(str(((state.get("recordings") or {}).get(side) or {}).get("videoPath") or "")).expanduser()
         info = inspect_media(video_path, "video")
-        browser_result = task_root / "monitor" / "recording" / side.lower() / "web-otty" / "browser-result.json"
+        recording_side_dir = task_root / "monitor" / "recording" / side.lower()
+        browser_result = recording_side_dir / "web-terminal" / "browser-result.json"
+        if not browser_result.is_file():
+            # Recordings made before the Terminal.app switch used the Otty directory name.
+            browser_result = recording_side_dir / "web-otty" / "browser-result.json"
         browser_status = str(load_json(browser_result).get("status") or "")
         info["browserResult"] = str(browser_result) if browser_result.is_file() else ""
         info["browserStatus"] = browser_status

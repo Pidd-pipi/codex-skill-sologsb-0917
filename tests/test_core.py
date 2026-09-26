@@ -6,6 +6,7 @@ import http.server
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import time
 import unittest
 import urllib
 import zipfile
+from typing import Any
 from collections import UserDict
 from unittest import mock
 from pathlib import Path
@@ -74,16 +76,22 @@ from github_repo import (
 )  # noqa: E402
 from semantic_review import validate_review  # noqa: E402
 import side_runner  # noqa: E402
+import recorder  # noqa: E402
 from recorder import default_plan, prepare_recording, recording_output_name  # noqa: E402
 from recorder import (  # noqa: E402
-    _capture_otty_pane_text,
+    _canonical_owner,
+    _capture_terminal_text,
+    _chrome_command,
     _copy_final,
     _ensure_sck_recorder,
     _MouseCursorGuard,
     SCK_RECORDER_SOURCE,
     normalize_pointer_strategy,
-    _otty_open_window,
     _recording_service_ports,
+    _terminal_close_window,
+    _terminal_open_window,
+    _terminal_title_is_clean,
+    normalize_terminal_app,
     _require_window_id,
     _validate_recording_window,
     recording_isolation_ok,
@@ -103,19 +111,19 @@ class ProxyTests(unittest.TestCase):
     def test_explicit_github_proxy_is_injected(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {"SOLOSB_GITHUB_PROXY": "http://127.0.0.1:17890"},
+            {"SOLOSB_GITHUB_PROXY": "7897"},
             clear=False,
         ):
             env = github_env()
-        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:17890")
-        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:17890")
-        self.assertEqual(env["ALL_PROXY"], "http://127.0.0.1:17890")
+        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
+        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
+        self.assertEqual(env["ALL_PROXY"], "http://127.0.0.1:7897")
         self.assertIn("127.0.0.1", env["NO_PROXY"])
 
     def test_required_github_proxy_fails_closed(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch("common._proxy_port_open", return_value=False):
-                with self.assertRaisesRegex(SologsbError, "Loon GitHub 代理不可用"):
+                with self.assertRaisesRegex(SologsbError, "Clash Verge GitHub 代理不可用"):
                     github_env(require_proxy=True)
 
 
@@ -372,6 +380,13 @@ class ExcelTests(unittest.TestCase):
         self.assertTrue(reason_style_errors("A 侧方案把根因写成配置缺失。"))
         self.assertTrue(reason_style_errors("A 侧方案把改动入库，计数 2 变 22。"))
         self.assertTrue(reason_style_errors("A 侧方案读取 Mock 服务配置。"))
+        legacy = reason_style_errors("A 侧方案实现验收，这题最要紧的是状态一致。")
+        self.assertTrue(any("这题" in item for item in legacy), legacy)
+        self.assertTrue(any("最要紧" in item for item in legacy), legacy)
+        self.assertEqual(
+            reason_style_errors("A 侧方案实现验收，这个任务最重要的是状态一致。"),
+            [],
+        )
         self.assertEqual(reason_style_warnings("A 侧方案建了独立表，读库时发现停用位被默认值覆盖掉了。"), [])
         self.assertTrue(any("空泛表达" in item for item in reason_style_warnings("A 侧方案真实完成入库。")))
         warnings = reason_style_warnings("A 侧方案建独立表。读库发现默认值盖掉停用位。保存后读回正常。")
@@ -638,7 +653,7 @@ class DeliveryFieldTests(unittest.TestCase):
 
     REASON = (
         "A 侧方案在打开api.ts的请求定义时多拼了一层前缀，登录一直被挡在外面，页面进不去日记。"
-        "B 侧方案补跑了发布流程并回读快照，这题最要紧的是能完整走通，因此选择 B 侧方案。"
+        "B 侧方案补跑了发布流程并回读快照，这个任务最重要的是能完整走通，因此选择 B 侧方案。"
     )
     DESC_A = "登录请求在frontend/src/api.ts里多拼了一层前缀，接口返回404。用户进不了日记页，保存和发布需求都没法验证。"
     DESC_B = "逐条核对了选择行程、存草稿、发起人发布和冻结标题四项需求，构建和启动都通过，刷新后版本与发布状态一致。"
@@ -951,11 +966,53 @@ class ReasonFlowTests(unittest.TestCase):
 
     def test_natural_reason_passes(self) -> None:
         reason = (
-            "A 侧方案在打开api.ts的请求定义时多拼了一层前缀，登录一直被挡在外面，页面进不去日记。"
-            "B 侧方案补跑了发布流程并回读快照，存草稿和发布都能走通。"
-            "这题最要紧的是能完整走通，因此选择 B 侧方案。"
+            "A 侧方案在打开api.ts的请求定义时多拼了一层前缀，结果登录一直被挡在外面，页面进不去日记。"
+            "B 侧方案补跑了发布流程并回读快照，存草稿和发布都能走通，但页面样式还比较简单。"
+            "这个任务最重要的是能完整走通，因此选择 B 侧方案。"
         )
         self.assertEqual(reason_flow_errors(reason), [])
+
+    def test_telegraphic_reason_blocks(self) -> None:
+        reason = (
+            "A 侧方案在服务层加了乐观锁。并发保存先提交标题未更新。B 侧方案补了版本号校验。随后回读了数据。"
+            "A 侧方案页面能打开。B 侧方案发布成功。两侧都跑了build。这个任务最重要的是并发保存不丢数据，因此选择 B 侧方案。"
+        )
+        errors = reason_flow_errors(reason)
+        self.assertTrue(any("电报体" in item for item in errors), errors)
+        self.assertTrue(any("衔接" in item for item in errors), errors)
+        self.assertTrue(any("先提交标题未更新" in item for item in errors), errors)
+
+    def test_missing_criterion_blocks(self) -> None:
+        reason = (
+            "A 侧方案在服务层给文章表加了乐观锁，但两个人同时保存时，先提交的一方写进去了，标题却没有跟着更新。"
+            "结果刷新页面后看到的还是旧标题，这次编辑等于没有保存。"
+            "B 侧方案在保存接口里补了版本号校验，后提交的一方会收到冲突提示，回读时标题和正文都是新值。"
+            "因此选择 B 侧方案，它保存后的标题和正文都可以放心交给编辑继续使用。"
+        )
+        self.assertTrue(any("扣分点" in item for item in reason_flow_errors(reason)))
+
+
+    def test_subjectless_opener_and_form_option_block(self) -> None:
+        reason = (
+            "检查提交流程里的迁移脚本与快照表改动后，Go二进制、Vite产物和镜像均生成成功。"
+            "A 侧方案首次启动时examinees表约束名不匹配，删除唯一约束返回错误码42704导致容器持续退出。"
+            "B 侧方案首次启动时migrateAndSeed删users旧约束，让服务终止且Web入口没有监听。"
+            "这个任务最重要的是程序能否启动，两边都卡在数据库迁移，实际持平，所以选Same。"
+        )
+        errors = reason_flow_errors(reason)
+        self.assertTrue(any("“检查”起头" in item for item in errors), errors)
+        self.assertTrue(any("打平" in item for item in reason_style_errors("两侧卡在同一处，因此两侧打平。")))
+
+    def test_natural_same_reason_passes(self) -> None:
+        reason = (
+            "A 侧方案检查了迁移脚本和快照表的改动，前后端编译和镜像构建都成功了。"
+            "但首次启动时删除examinees表的唯一约束，找不到对应的约束名，容器反复退出。"
+            "结果登记页面和结果页面都打不开，快照功能没法在运行中确认。"
+            "B 侧方案核对过数据模型和版本历史，构建同样通过，可是migrateAndSeed删除users表旧约束也出错了。"
+            "这个任务最重要的是程序能不能跑起来，两侧都卡在数据库迁移，服务都没起来，因此选择Same。"
+        )
+        self.assertEqual(reason_flow_errors(reason), [])
+        self.assertEqual(reason_language_errors(reason), [])
 
 
 class DeliverySubmissionTests(unittest.TestCase):
@@ -1035,7 +1092,7 @@ class VideoTests(unittest.TestCase):
             {
                 "kCGWindowNumber": 6457,
                 "kCGWindowOwnerPID": 768,
-                "kCGWindowOwnerName": "Otty",
+                "kCGWindowOwnerName": "终端",
                 "kCGWindowName": "sologsb-a",
                 "kCGWindowLayer": 0,
                 "kCGWindowBounds": {"X": 10, "Y": 20, "Width": 1280, "Height": 720},
@@ -1052,7 +1109,7 @@ class VideoTests(unittest.TestCase):
             {
                 "kCGWindowNumber": 6457,
                 "kCGWindowOwnerPID": 768,
-                "kCGWindowOwnerName": "Otty",
+                "kCGWindowOwnerName": "终端",
                 "kCGWindowName": "sologsb-a",
                 "kCGWindowLayer": 0,
                 "kCGWindowBounds": UserDict(
@@ -1068,14 +1125,14 @@ class VideoTests(unittest.TestCase):
         expected = {
             "windowId": 6457,
             "ownerPid": 768,
-            "ownerName": "Otty",
+            "ownerName": "终端",
             "windowName": "sologsb-a",
             "bounds": "10,20,1280,720",
         }
         live = {
             "kCGWindowNumber": 6457,
             "kCGWindowOwnerPID": 768,
-            "kCGWindowOwnerName": "Otty",
+            "kCGWindowOwnerName": "终端",
             "kCGWindowName": "sologsb-a",
             "kCGWindowIsOnscreen": True,
             "kCGWindowLayer": 0,
@@ -1115,20 +1172,121 @@ class VideoTests(unittest.TestCase):
             self.assertFalse(report["mouseButtonsQueried"])
             self.assertFalse(report["parkApplied"])
 
-    def test_web_mode_captures_real_otty_pane_text(self) -> None:
+    def test_web_mode_captures_real_terminal_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "terminal.log"
-            proc = subprocess.CompletedProcess(
-                args=["otty-cli"],
-                returncode=0,
-                stdout=b"server ready\nGET /api/items 200\n",
-                stderr=b"",
-            )
-            with mock.patch("recorder._otty_call", return_value=proc) as call:
-                text = _capture_otty_pane_text("pane-1", output, lines=400)
+            with mock.patch(
+                "recorder._terminal_history",
+                return_value="sologsb app % pnpm dev\nserver ready\nGET /api/items 200",
+            ) as history:
+                text = _capture_terminal_text(4242, output)
             self.assertIn("GET /api/items 200", text)
-            self.assertIn("GET /api/items 200", output.read_text(encoding="utf-8"))
-            self.assertIn("--lines", call.call_args.args[0])
+            self.assertTrue(output.read_text(encoding="utf-8").endswith("200\n"))
+            history.assert_called_once_with(4242)
+            with mock.patch("recorder._terminal_history", return_value="  \n"):
+                with self.assertRaisesRegex(SologsbError, "无法抓取 Terminal 窗口文本"):
+                    _capture_terminal_text(4242, Path(temp) / "empty.log")
+
+    def test_terminal_close_waits_for_tty_processes_before_closing(self) -> None:
+        events: list[str] = []
+        remaining = [[101, 102], [101, 102], [], [], []]
+
+        def fake_pids(_tty: str) -> list[int]:
+            pids = remaining.pop(0) if remaining else []
+            events.append(f"pids:{len(pids)}")
+            return pids
+
+        def fake_kill(pid: int, sig: int) -> None:
+            events.append(f"kill:{pid}:{int(sig)}")
+
+        def fake_osascript(script: str, *args: str, **_kwargs: Any) -> str:
+            events.append("close")
+            self.assertIn("close (every window whose id is", script)
+            self.assertEqual(args, ("4242",))
+            return ""
+
+        with mock.patch("recorder._tty_user_pids", side_effect=fake_pids), \
+                mock.patch("recorder.os.kill", side_effect=fake_kill), \
+                mock.patch("recorder._osascript", side_effect=fake_osascript):
+            self.assertTrue(_terminal_close_window(4242, "/dev/ttys009"))
+        self.assertEqual(events[-1], "close")
+        self.assertLess(events.index(f"kill:101:{int(signal.SIGTERM)}"), events.index("close"))
+
+    def test_terminal_close_refuses_while_processes_survive(self) -> None:
+        with mock.patch("recorder._tty_user_pids", return_value=[101]), \
+                mock.patch("recorder.os.kill"), \
+                mock.patch("recorder.time.sleep"), \
+                mock.patch("recorder._osascript") as osascript:
+            self.assertFalse(_terminal_close_window(4242, "/dev/ttys009"))
+        osascript.assert_not_called()
+
+    def test_terminal_open_failure_closes_orphan_windows(self) -> None:
+        window_ids = [{10}, {10, 4242}]
+        with mock.patch("recorder._terminal_window_ids", side_effect=lambda: window_ids.pop(0)), \
+                mock.patch("recorder._osascript", side_effect=SologsbError("osascript 超时(20s)")), \
+                mock.patch("recorder._terminal_close_window") as close_window:
+            with self.assertRaisesRegex(SologsbError, "osascript 超时"):
+                _terminal_open_window("sologsb-late-window")
+        close_window.assert_called_once_with(4242)
+
+    def test_focus_guard_restores_when_earlier_recording_app_is_frontmost(self) -> None:
+        user = {"status": "captured", "pid": 4260, "name": "微信", "bundleId": "com.tencent.xinWeChat"}
+        terminal = {"windowId": 50735, "ownerPid": 45600, "ownerName": "终端"}
+        user_window = {"windowId": 48558, "ownerPid": 4260, "ownerName": "微信"}
+        frontmost = [user_window, terminal, user_window, user_window]
+        with mock.patch.object(recorder._FocusRestoreGuard, "_capture_frontmost_app", return_value=user), \
+                mock.patch("recorder._frontmost_window_info", side_effect=lambda: frontmost.pop(0) if len(frontmost) > 1 else frontmost[0]):
+            guard = recorder._FocusRestoreGuard()
+            guard.restore_if_recording_frontmost({45600}, "terminal-open", {50735})
+            with mock.patch.object(guard, "_activate_original", return_value=True) as activate:
+                event = guard.restore_if_recording_frontmost({46373}, "chrome-open", {50739})
+        activate.assert_called_once()
+        self.assertEqual(event["action"], "restore-user-app")
+        self.assertTrue(event["restored"])
+
+    def test_visible_command_gate_blocks_credential_output(self) -> None:
+        recorder.assert_visible_commands_safe({
+            "startCommand": "pnpm dev --host 127.0.0.1",
+            "commands": ["curl -s http://127.0.0.1:3000/api/items", "cp .env.example .env.local && ls"],
+            "apiRequests": [{"url": "http://127.0.0.1:3000/api", "headers": {"Authorization": "Bearer test-token"}}],
+        })
+        for bad in ["cat .env", "printenv", "env | grep KEY", "cat ~/.codex/sologsb/config.json",
+                    "echo $SOLOSB_CLAUDE_KEY", "curl -H 'x: sk-ant-abcdefghijklmnopqrstu' x",
+                    "history"]:
+            with self.assertRaisesRegex(SologsbError, "录进视频"):
+                recorder.assert_visible_commands_safe({"startCommand": "pnpm dev", "commands": [bad]})
+        with self.assertRaisesRegex(SologsbError, "Key/Token"):
+            recorder.assert_visible_commands_safe({"startCommand": "pnpm dev", "apiRequests": [
+                {"url": "http://127.0.0.1/x", "headers": {"Authorization": "Bearer ghp_abcdefghijklmnopqrstuvwxyz"}}]})
+
+    def test_terminal_title_gate_rejects_process_arguments(self) -> None:
+        self.assertTrue(_terminal_title_is_clean("sologsb \u2014 sologsb"))
+        self.assertTrue(_terminal_title_is_clean("sologsb"))
+        self.assertFalse(_terminal_title_is_clean(""))
+        self.assertFalse(_terminal_title_is_clean("sologsb \u2014 sologsb \u2014 zsh -f"))
+        self.assertFalse(_terminal_title_is_clean(
+            "sologsb \u2014 esbuild \u00b7 npm run dev --port 1 ANTHROPIC_API_KEY=x"
+        ))
+
+    def test_terminal_app_normalization_maps_legacy_otty(self) -> None:
+        self.assertEqual(normalize_terminal_app(""), "terminal")
+        self.assertEqual(normalize_terminal_app("otty"), "terminal")
+        self.assertEqual(normalize_terminal_app("Terminal"), "terminal")
+        with self.assertRaisesRegex(SologsbError, "terminalApp=terminal"):
+            normalize_terminal_app("iterm2")
+        self.assertEqual(_canonical_owner("终端"), "Terminal")
+        self.assertEqual(_canonical_owner("ターミナル", "com.apple.Terminal"), "Terminal")
+        self.assertEqual(_canonical_owner("Google Chrome"), "Chrome")
+        self.assertEqual(_canonical_owner("Otty"), "Otty")
+
+    def test_chrome_launch_never_opens_a_foreground_window(self) -> None:
+        command = _chrome_command(Path("/tmp/profile"), 9333)
+        self.assertTrue(command[0].endswith("/Contents/MacOS/Google Chrome"))
+        self.assertIn("--no-startup-window", command)
+        self.assertNotIn("open", command)
+        self.assertNotIn("--new-window", command)
+        self.assertNotIn("about:blank", command)
+        self.assertIn("--remote-debugging-port=9333", command)
 
     def test_recording_service_ports_only_uses_local_targets(self) -> None:
         ports = _recording_service_ports(
@@ -1141,19 +1299,8 @@ class VideoTests(unittest.TestCase):
         )
         self.assertEqual(ports, [5174, 8080, 9091, 18415])
 
-    def test_late_otty_window_after_open_timeout_is_cleaned_up(self) -> None:
-        with mock.patch("recorder._otty_call", side_effect=SologsbError("IPC response timed out")):
-            with mock.patch(
-                "recorder._otty_json",
-                return_value=[{"id": "w_late", "title": "sologsb-late-window"}],
-            ):
-                with mock.patch("recorder._otty_close_window") as close_window:
-                    with self.assertRaisesRegex(SologsbError, "IPC response timed out"):
-                        _otty_open_window("sologsb-late-window")
-        close_window.assert_called_once_with("w_late")
-
     def test_recording_isolation_gate_requires_window_ids(self) -> None:
-        captures = [{"status": "ok", "captureKind": "window-id", "captureBackend": "screen-capture-kit", "showsCursor": False, "cursorCaptured": False, "windowId": 6457, "ownerPid": 768, "ownerName": "Otty"}]
+        captures = [{"status": "ok", "captureKind": "window-id", "captureBackend": "screen-capture-kit", "showsCursor": False, "cursorCaptured": False, "windowId": 6457, "ownerPid": 768, "ownerName": "终端", "visualContent": {"ok": True}}]
         guards = [{
             "status": "ok",
             "pointerStrategy": "none",
@@ -1201,7 +1348,7 @@ class VideoTests(unittest.TestCase):
                     "captureKind": "window-id",
                     "windowId": 6457,
                     "ownerPid": 768,
-                    "ownerName": "Otty",
+                    "ownerName": "终端",
                 }],
                 guard_reports=guards,
                 frontmost_report=frontmost,
@@ -1209,7 +1356,7 @@ class VideoTests(unittest.TestCase):
             )
         )
         web_captures = [
-            {"status": "ok", "captureKind": "window-id", "captureBackend": "screen-capture-kit", "showsCursor": False, "cursorCaptured": False, "windowId": 6457, "ownerPid": 768, "ownerName": "Otty"},
+            {"status": "ok", "captureKind": "window-id", "captureBackend": "screen-capture-kit", "showsCursor": False, "cursorCaptured": False, "windowId": 6457, "ownerPid": 768, "ownerName": "终端", "ownerBundleId": "com.apple.Terminal"},
             {"status": "ok", "captureKind": "window-id", "captureBackend": "screen-capture-kit", "showsCursor": False, "cursorCaptured": False, "windowId": 6458, "ownerPid": 769, "ownerName": "Chrome"},
         ]
         self.assertTrue(
@@ -1272,9 +1419,9 @@ class VideoTests(unittest.TestCase):
                     _ensure_sck_recorder()
 
     def test_window_id_gate_rejects_missing_identity(self) -> None:
-        self.assertEqual(_require_window_id({"windowId": 6457, "ownerPid": 768}, "Otty")["windowId"], 6457)
-        with self.assertRaisesRegex(SologsbError, "无法定位Otty窗口ID"):
-            _require_window_id({"windowId": 0, "ownerPid": 0}, "Otty")
+        self.assertEqual(_require_window_id({"windowId": 6457, "ownerPid": 768}, "Terminal")["windowId"], 6457)
+        with self.assertRaisesRegex(SologsbError, "无法定位Terminal窗口ID"):
+            _require_window_id({"windowId": 0, "ownerPid": 0}, "Terminal")
 
     def test_recording_plan_uses_mapped_candidate_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1327,12 +1474,14 @@ class VideoTests(unittest.TestCase):
             recording_command_ok(0, True)
 
     def test_only_terminal_and_chrome_are_allowed(self) -> None:
-        self.assertEqual(validate_recording_targets("web", ["Otty", "Chrome"]), ["Otty", "Chrome"])
-        self.assertEqual(validate_recording_targets("terminal", ["Otty"]), ["Otty"])
+        self.assertEqual(validate_recording_targets("web", ["Terminal", "Chrome"]), ["Terminal", "Chrome"])
+        self.assertEqual(validate_recording_targets("terminal", ["Terminal"]), ["Terminal"])
+        # Plans written before the Terminal.app switch still validate.
+        self.assertEqual(validate_recording_targets("web", ["Otty", "Chrome"], "otty"), ["Terminal", "Chrome"])
         with self.assertRaises(Exception):
             validate_recording_targets("web", ["iTerm2", "Chrome"], "iterm2")
         with self.assertRaises(Exception):
-            validate_recording_targets("web", ["Otty", "Chrome", "Finder"])
+            validate_recording_targets("web", ["Terminal", "Chrome", "Finder"])
 
     def test_backend_plan_requires_api_requests(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1366,7 +1515,7 @@ class VideoTests(unittest.TestCase):
             })
             plan = default_plan(root, "A")
             self.assertEqual(plan["mode"], "terminal")
-            self.assertEqual(plan["targetApps"], ["Otty"])
+            self.assertEqual(plan["targetApps"], ["Terminal"])
             self.assertTrue(plan["requiresApiRequests"])
             self.assertEqual(plan["apiBaseUrl"], "http://127.0.0.1:8080")
 
@@ -2815,6 +2964,73 @@ class ContainerLimitTests(unittest.TestCase):
                 reservation.release()
                 excluded = limiter.acquire("gb-501", "sologsb-gb-501-20260919-000000-candidate-1-1-a")
                 self.assertIsNone(excluded.path)
+
+    def test_monitor_can_make_every_running_container_count(self) -> None:
+        docker_ps = "\n".join([
+            "sologsb-cy-1-20260919-000745-candidate-1-1-a\tcy-1\ttrue",
+            "cy180-web-1\t\t",
+            "friendly_keller\t\t",
+            "ld427-db\t\t",
+        ]).encode("utf-8")
+        ok = subprocess.CompletedProcess([], 0, stdout=docker_ps, stderr=b"")
+        with tempfile.TemporaryDirectory() as temp, \
+                mock.patch.object(side_runner, "run", return_value=ok):
+            config = Path(temp) / "container-limit.json"
+            write_json(config, {"maxContainers": 4, "excludedProjectCodes": ["ld427"],
+                                "managedBy": "sologsb-monitor"})
+            limiter = side_runner._ContainerLimiter(config)
+            self.assertEqual(limiter.status()["runningContainers"], 1)
+            write_json(config, {"maxContainers": 4, "excludedProjectCodes": ["ld427"],
+                                "managedBy": "sologsb-monitor", "countAllContainers": True})
+            status = limiter.status()
+            self.assertEqual(status["runningContainers"], 3)
+            self.assertNotIn("ld427-db", status["runningNames"])
+
+
+class ContainerImageTests(unittest.TestCase):
+    def test_default_image_matches_device_config_default(self) -> None:
+        import device_config as dc
+
+        self.assertEqual(dc.FIELDS["claude.image"][1], "adminfather/benzhi-claude-code2:20260919")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SOLOSB_DOCKER_IMAGE", None)
+            reloaded = importlib.reload(side_runner)
+            try:
+                self.assertEqual(reloaded.DEFAULT_IMAGE, dc.FIELDS["claude.image"][1])
+            finally:
+                importlib.reload(side_runner)
+
+    def test_start_container_does_not_depend_on_image_entrypoint_or_base_url(self) -> None:
+        # 新镜像的 entrypoint 放宽了 /workspace 非空检查，并内置了自己的 ANTHROPIC_BASE_URL；
+        # 运行器必须绕过 entrypoint、显式传入 Base URL，才不受镜像差异影响。
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "ws"
+            attempt = root / "attempt"
+            workspace.mkdir()
+            attempt.mkdir()
+            captured: list[list[str]] = []
+
+            def fake_run(cmd, **_kwargs):
+                captured.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+            slot = mock.Mock()
+            with mock.patch.object(side_runner, "run", side_effect=fake_run), \
+                    mock.patch.object(side_runner, "_docker_running", return_value=True), \
+                    mock.patch.object(side_runner, "task_project_code", return_value=""), \
+                    mock.patch.object(side_runner._CONTAINER_LIMITER, "acquire", return_value=slot):
+                info = side_runner._start_container(
+                    task_root=root, side="candidate-1", attempt_dir=attempt,
+                    workspace=workspace, secret="s", base_url="https://relay.example",
+                )
+            cmd = captured[0]
+            self.assertEqual(cmd[cmd.index("--entrypoint") + 1], "/bin/bash")
+            self.assertEqual(cmd[cmd.index("--entrypoint") + 2], side_runner.DEFAULT_IMAGE)
+            self.assertIn("ANTHROPIC_BASE_URL=https://relay.example", cmd)
+            self.assertIn("--cap-drop", cmd)
+            self.assertFalse(any("docker.sock" in part for part in cmd))
+            self.assertEqual(info["image"], side_runner.DEFAULT_IMAGE)
 
 
 class VersionTests(unittest.TestCase):

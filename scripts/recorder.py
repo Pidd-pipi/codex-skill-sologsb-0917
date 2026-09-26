@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import getpass
 import hashlib
 import json
 import os
@@ -39,8 +40,31 @@ from gsb_tools import refresh_excel
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 CHECK_ENV = RECORDER_DIR / "scripts" / "check_environment.sh"
-OTTY_CLI = Path("/Applications/Otty.app/Contents/MacOS/otty-cli")
-OTTY_BROWSER_DRIVER = RECORDER_DIR / "scripts" / "human_browser_driver.cjs"
+BROWSER_DRIVER = RECORDER_DIR / "scripts" / "human_browser_driver.cjs"
+CHROME_BINARY = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+CHROME_BUNDLE_ID = "com.google.Chrome"
+# 16:9 so the 2x capture (2880x1620) fills 1280x720 without pillarboxing.
+CHROME_WINDOW_BOUNDS = (40, 40, 1440, 810)
+TERMINAL_BUNDLE_ID = "com.apple.Terminal"
+# Quartz reports the localized process name, e.g. "终端" on a Chinese system.
+TERMINAL_OWNER_NAMES = {"Terminal", "终端"}
+TERMINAL_PROFILE_NAME = "sologsb"
+# AppleScript bounds: left, top, right, bottom.
+TERMINAL_WINDOW_BOUNDS = (40, 40, 1320, 760)
+# Every lossy pass smears UI text, so intermediates are near-lossless and only the
+# final file uses the delivery CRF; lanczos keeps glyph edges crisp when downscaling.
+VIDEO_SCALE_FILTER = (
+    "scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,"
+    "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+)
+INTERMEDIATE_X264_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "10", "-tune", "animation", "-pix_fmt", "yuv420p"]
+FINAL_X264_ARGS = ["-c:v", "libx264", "-preset", "slow", "-crf", "16", "-tune", "animation", "-pix_fmt", "yuv420p"]
+TERMINAL_OSASCRIPT_TIMEOUT = 20.0
+TERMINAL_APP = "terminal"
+TERMINAL_APP_ALIASES = {"", "terminal", "terminal.app", "otty"}
+TERMINAL_TARGET_ALIASES = {"Terminal", "Terminal.app", "终端", "Otty"}
+WEB_RUNTIME_DIR = "web-terminal"
+TERMINAL_RUNTIME_DIR = "terminal-session"
 SCK_RECORDER_SOURCE = SKILL_ROOT / "scripts" / "screencapturekit_window_recorder.swift"
 SCK_RECORDER_CACHE_DIR = CODEX_HOME / "cache" / "sologsb-0917" / "bin"
 SCK_RECORDER_MIN_MACOS = "15.0"
@@ -52,141 +76,343 @@ POINTER_POLICIES = {
     "none": "host-input-untouched",
 }
 LEGACY_POINTER_STRATEGIES = {"background", "park-pointer"}
-RECORDING_WINDOW_OWNERS = {"Otty", "Google Chrome", "Chrome"}
+RECORDING_WINDOW_OWNERS = TERMINAL_OWNER_NAMES | {"Google Chrome", "Chrome"}
+RECORDING_WINDOW_BUNDLES = {TERMINAL_BUNDLE_ID: "Terminal", CHROME_BUNDLE_ID: "Chrome"}
 
 
-def _otty_call(args: list[str], *, input_data: bytes | None = None, check: bool = True):
-    if not OTTY_CLI.is_file():
-        raise SologsbError(f"缺少 Otty CLI: {OTTY_CLI}")
-    proc = run([str(OTTY_CLI), *args], input_data=input_data, check=False, timeout=600)
-    if check and proc.returncode != 0:
-        raise SologsbError(
-            proc.stderr.decode("utf-8", errors="replace")
-            or proc.stdout.decode("utf-8", errors="replace")
-            or f"Otty CLI 失败: {' '.join(args)}"
+TERMINAL_OPEN_SCRIPT = """
+on run argv
+  tell application "Terminal"
+    set t to do script ""
+    set w to first window whose tabs contains t
+    set current settings of t to settings set (item 2 of argv)
+    set custom title of t to (item 1 of argv)
+    set bounds of w to {(item 3 of argv) as integer, (item 4 of argv) as integer, (item 5 of argv) as integer, (item 6 of argv) as integer}
+    return ((id of w) as text) & "|" & (tty of t)
+  end tell
+end run
+"""
+
+# Terminal only exposes these title toggles through its prefs, not AppleScript.
+# Without them the title bar shows the foreground command line (e.g. `env ... npm run dev`).
+TERMINAL_PROFILE_TITLE_KEYS = {
+    "ShowActiveProcessInTitle": False,
+    "ShowActiveProcessArgumentsInTitle": False,
+    "ShowActiveProcessInTabTitle": False,
+    "ShowActiveProcessArgumentsInTabTitle": False,
+    "ShowCommandKeyInTitle": False,
+    "ShowComponentsWhenTabHasCustomTitle": False,
+    "ShowDimensionsInTitle": False,
+    "ShowRepresentedURLInTitle": False,
+    "ShowRepresentedURLPathInTitle": False,
+    "ShowShellCommandInTitle": False,
+    "ShowTTYNameInTabTitle": False,
+    "ShowTTYNameInTitle": False,
+    "ShowWindowSettingsNameInTitle": False,
+}
+
+TERMINAL_PROFILE_SCRIPT = """
+on run argv
+  set profileName to item 1 of argv
+  tell application "Terminal"
+    if not (exists settings set profileName) then
+      make new settings set with properties {name:profileName}
+    end if
+    tell settings set profileName
+      set title displays device name to false
+      set title displays shell path to false
+      set title displays window size to false
+      set title displays settings name to false
+      set title displays custom title to true
+    end tell
+  end tell
+end run
+"""
+
+
+def _osascript(
+    script: str,
+    *args: str,
+    timeout: float = TERMINAL_OSASCRIPT_TIMEOUT,
+    check: bool = True,
+) -> str:
+    try:
+        proc = run(
+            ["osascript", "-", *[str(value) for value in args]],
+            input_data=script.encode("utf-8"),
+            timeout=timeout,
+            check=False,
         )
-    return proc
+    except subprocess.TimeoutExpired as exc:
+        raise SologsbError(f"osascript 超时({timeout:.0f}s)，Terminal 可能弹出了确认对话框") from exc
+    if proc.returncode != 0:
+        error = proc.stderr.decode("utf-8", errors="replace").strip()
+        if "-1743" in error:
+            raise SologsbError(
+                "未授权自动化控制 Terminal：请在 系统设置 > 隐私与安全性 > 自动化 中允许当前进程控制“终端”"
+            )
+        if check:
+            raise SologsbError(f"osascript 失败: {error or proc.returncode}")
+    return proc.stdout.decode("utf-8", errors="replace").strip()
 
 
-def _otty_json(args: list[str]) -> Any:
-    proc = _otty_call([*args, "--json"])
-    try:
-        payload = json.loads(proc.stdout.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise SologsbError(f"Otty 没有返回有效 JSON: {proc.stdout.decode('utf-8', errors='replace')[:1000]}") from exc
-    if payload.get("ok") is False:
-        raise SologsbError(str(payload.get("error") or payload))
-    return payload.get("data")
+def _terminal_is_running() -> bool:
+    return run(["pgrep", "-x", "Terminal"], check=False).returncode == 0
 
 
-def _otty_config_get(key: str) -> str:
-    payload = _otty_json(["config", "get", key])
-    if isinstance(payload, dict):
-        return str(payload.get("value") or "")
-    return str(payload or "")
+def _terminal_window_ids() -> set[int]:
+    # Never talk to Terminal via AppleScript unless it is already running:
+    # an AppleScript launch opens a foreground default window.
+    if not _terminal_is_running():
+        return set()
+    output = _osascript('tell application "Terminal" to get id of every window', check=False)
+    return {int(value) for value in re.findall(r"\d+", output)}
 
 
-@contextlib.contextmanager
-def _otty_send_keys_enabled():
-    original = _otty_config_get("ipc-allow-send-keys")
-    try:
-        _otty_call(["config", "set", "ipc-allow-send-keys", "true"])
-        yield
-    finally:
-        if original:
-            _otty_call(["config", "set", "ipc-allow-send-keys", original], check=False)
-        else:
-            _otty_call(["config", "unset", "ipc-allow-send-keys"], check=False)
-        _otty_call(["config", "reload", "--json"], check=False)
-
-
-def _otty_open_window(title: str, cwd: Path | None = None) -> tuple[str, str]:
-    args = ["open", "--title", title, "--command", "/bin/zsh"]
-    if cwd is not None:
-        args.append(str(cwd))
-    args.append("--json")
-    try:
-        before = {
-            str(item.get("id") or "")
-            for item in (_otty_json(["window", "list"]) or [])
-            if str(item.get("id") or "")
-        }
-    except Exception:
-        before = set()
-    try:
-        _otty_call(args)
-    except Exception:
-        # Otty can acknowledge open too late and still create the window after
-        # reporting an IPC timeout. Best-effort cleanup prevents orphan windows.
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            try:
-                windows = _otty_json(["window", "list"]) or []
-            except Exception:
-                windows = []
-            match = next((item for item in windows if item.get("title") == title), None)
-            if not match:
-                new_windows = [item for item in windows if str(item.get("id") or "") not in before]
-                match = new_windows[0] if len(new_windows) == 1 else None
-            if match:
-                _otty_close_window(str(match.get("id") or ""))
-                break
-            time.sleep(0.25)
-        raise
-    window_id = ""
-    for _ in range(160):
-        windows = _otty_json(["window", "list"]) or []
-        match = next((item for item in windows if item.get("title") == title), None)
-        if not match:
-            new_windows = [item for item in windows if str(item.get("id") or "") not in before]
-            match = new_windows[0] if len(new_windows) == 1 else None
-        if match:
-            window_id = str(match.get("id") or "")
-            if window_id:
-                break
-        time.sleep(0.25)
-    if not window_id:
-        raise SologsbError(f"无法定位新建的 Otty 窗口: {title}")
-    panes = _otty_json(["pane", "list", "--window", window_id]) or []
-    if not panes:
-        raise SologsbError(f"Otty 窗口没有 pane: {window_id}")
-    pane_id = str(panes[0].get("id") or "")
-    if not pane_id:
-        raise SologsbError(f"无法定位 Otty pane: {window_id}")
-    return window_id, pane_id
-
-
-def _otty_close_window(window_id: str) -> None:
-    if window_id:
-        _otty_call(["window", "close", window_id, "--force", "--yes", "--json"], check=False)
-
-
-def _otty_send(pane_id: str, command: str) -> None:
-    _otty_call(["pane", "send-keys", "--pane", pane_id, command, "key:Enter", "--json"])
-
-
-def _capture_otty_pane_text(pane_id: str, output: Path, *, lines: int = 400) -> str:
-    """Persist the real Otty pane text for Web recordings."""
-    proc = _otty_call(
-        [
-            "pane",
-            "capture",
-            "--pane",
-            pane_id,
-            "--lines",
-            str(lines),
-            "--format",
-            "text",
-        ],
+def _terminal_window_tty(window_id: int) -> str:
+    return _osascript(
+        'on run argv\ntell application "Terminal" to get tty of tab 1 of window id ((item 1 of argv) as integer)\nend run',
+        str(window_id),
         check=False,
     )
-    text = proc.stdout.decode("utf-8", errors="replace")
-    if proc.returncode != 0 or not text.strip():
-        error = proc.stderr.decode("utf-8", errors="replace").strip() or text.strip()
-        raise SologsbError(f"无法抓取 Otty pane 文本: {error or '空输出'}")
+
+
+def _tty_user_pids(tty: str) -> list[int]:
+    """PIDs owned by the current user on a tty; the root-owned login process is left alone."""
+    name = Path(str(tty or "")).name
+    if not name:
+        return []
+    proc = run(["ps", "-t", name, "-o", "pid=,user="], check=False)
+    user = getpass.getuser()
+    pids: list[int] = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1] == user:
+            pids.append(int(parts[0]))
+    return pids
+
+
+def _terminal_close_window(window_id: int | str, tty: str = "") -> bool:
+    """Close a recorder-owned Terminal window without triggering the running-process sheet."""
+    try:
+        window_id = int(window_id or 0)
+    except (TypeError, ValueError):
+        return False
+    if window_id <= 0:
+        return False
+    if not tty:
+        tty = _terminal_window_tty(window_id)
+    if tty:
+        # zsh ignores TERM, so escalate TERM -> HUP -> KILL until the tty is empty.
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGKILL):
+            pids = _tty_user_pids(tty)
+            if not pids:
+                break
+            for pid in pids:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, sig)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and _tty_user_pids(tty):
+                time.sleep(0.1)
+        if _tty_user_pids(tty):
+            # Closing now would leave a persistent "terminate processes?" sheet.
+            return False
+    _osascript(
+        "on run argv\n"
+        "with timeout of 5 seconds\n"
+        'tell application "Terminal" to close (every window whose id is ((item 1 of argv) as integer))\n'
+        "end timeout\n"
+        "end run",
+        str(window_id),
+        check=False,
+    )
+    return True
+
+
+def _terminal_ensure_ready() -> bool:
+    """Start Terminal.app in the background; return True when the recorder launched it."""
+    if _terminal_is_running():
+        return False
+    run(
+        ["open", "-g", "-b", TERMINAL_BUNDLE_ID, "--args", "-ApplePersistenceIgnoreState", "YES"],
+        check=False,
+    )
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not _terminal_is_running():
+        time.sleep(0.2)
+    if not _terminal_is_running():
+        raise SologsbError("无法在后台启动 Terminal.app")
+    # A fresh launch opens one default window; only those startup windows are ours to close.
+    startup: set[int] = set()
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not startup:
+        startup = _terminal_window_ids()
+        time.sleep(0.2)
+    for window_id in startup:
+        _terminal_close_window(window_id)
+    return True
+
+
+def _terminal_quit_if_launched(launched: bool) -> None:
+    if launched and _terminal_is_running() and not _terminal_window_ids():
+        _osascript(
+            'with timeout of 5 seconds\ntell application "Terminal" to quit\nend timeout',
+            check=False,
+        )
+
+
+def _terminal_ensure_profile() -> None:
+    _osascript(TERMINAL_PROFILE_SCRIPT, TERMINAL_PROFILE_NAME)
+
+
+def _terminal_write_profile_prefs() -> None:
+    """Write the title toggles into the profile; Terminal only reads them at launch."""
+    from Foundation import NSUserDefaults  # type: ignore
+
+    defaults = NSUserDefaults.standardUserDefaults()
+    domain = dict(defaults.persistentDomainForName_(TERMINAL_BUNDLE_ID) or {})
+    settings = dict(domain.get("Window Settings") or {})
+    profile = dict(settings.get(TERMINAL_PROFILE_NAME) or {})
+    profile.setdefault("name", TERMINAL_PROFILE_NAME)
+    profile.setdefault("type", "Window Settings")
+    profile.setdefault("ProfileCurrentVersion", 2.09)
+    if all(profile.get(key) == value for key, value in TERMINAL_PROFILE_TITLE_KEYS.items()):
+        return
+    profile.update(TERMINAL_PROFILE_TITLE_KEYS)
+    settings[TERMINAL_PROFILE_NAME] = profile
+    domain["Window Settings"] = settings
+    defaults.setPersistentDomain_forName_(domain, TERMINAL_BUNDLE_ID)
+
+
+def _terminal_title_is_clean(title: str) -> bool:
+    parts = [part.strip() for part in str(title or "").split("\u2014")]
+    return bool(title) and all(part == TERMINAL_PROFILE_NAME for part in parts)
+
+
+def _terminal_assert_clean_title(window_id: int, *, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    title = ""
+    while time.monotonic() < deadline:
+        title = str(_window_info_by_id(window_id).get("windowName") or "")
+        if _terminal_title_is_clean(title):
+            return
+        time.sleep(0.2)
+    raise SologsbError(
+        f"Terminal 窗口标题会暴露进程/参数({title!r})：sologsb 描述文件的标题设置只在 Terminal 启动时读取，"
+        "请完全退出 Terminal.app 后重试"
+    )
+
+
+def _terminal_send(window_id: int, command: str) -> None:
+    _osascript(
+        'on run argv\ntell application "Terminal" to do script (item 2 of argv) in tab 1 of window id ((item 1 of argv) as integer)\nend run',
+        str(window_id),
+        command,
+    )
+
+
+def _terminal_history(window_id: int) -> str:
+    return _osascript(
+        'on run argv\ntell application "Terminal" to get history of tab 1 of window id ((item 1 of argv) as integer)\nend run',
+        str(window_id),
+        check=False,
+    )
+
+
+def _terminal_clean_shell_command(cwd: Path | None) -> str:
+    """Neutral prompt/title with no absolute paths, then wipe screen and scrollback."""
+    setup = [f"cd {shlex.quote(str(cwd))}"] if cwd is not None else []
+    setup.append("export PS1='sologsb %1~ %# '")
+    setup.append("precmd() { print -Pn '\\e]7;file:///sologsb\\a\\e]2;sologsb\\a\\e]1;sologsb\\a' }")
+    return " && ".join(setup) + "; clear && printf '\\033[3J'"
+
+
+def _terminal_wait_clean_prompt(window_id: int, *, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        last = _terminal_history(window_id).strip()
+        if last.startswith("sologsb ") and last.endswith("%") and "\n" not in last:
+            return
+        time.sleep(0.3)
+    raise SologsbError(f"Terminal 窗口未进入干净提示符: {last[-200:]!r}")
+
+
+def _terminal_open_window(title: str, cwd: Path | None = None) -> tuple[int, str]:
+    """Open one background Terminal window with a clean zsh; return (CGWindowID, tty)."""
+    before = _terminal_window_ids()
+    left, top, right, bottom = TERMINAL_WINDOW_BOUNDS
+    try:
+        output = _osascript(
+            TERMINAL_OPEN_SCRIPT,
+            title,
+            TERMINAL_PROFILE_NAME,
+            str(left),
+            str(top),
+            str(right),
+            str(bottom),
+        )
+        window_text, _, tty = output.partition("|")
+        window_id = int(window_text.strip())
+        tty = tty.strip()
+        if window_id <= 0 or not tty:
+            raise SologsbError(f"Terminal 返回了无效窗口: {output!r}")
+    except Exception:
+        for orphan in _terminal_window_ids() - before:
+            _terminal_close_window(orphan)
+        raise
+    try:
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and not _tty_user_pids(tty):
+            time.sleep(0.2)
+        # -f skips user rc files so plugins/themes never leak into the recording;
+        # the exported environment (PATH etc.) is inherited from the login shell.
+        _terminal_send(window_id, "exec /bin/zsh -f")
+        time.sleep(0.5)
+        _terminal_send(window_id, _terminal_clean_shell_command(cwd))
+        _terminal_wait_clean_prompt(window_id)
+        _terminal_assert_clean_title(window_id)
+    except Exception:
+        _terminal_close_window(window_id, tty)
+        raise
+    return window_id, tty
+
+
+def _terminal_prepare_clean(window_id: int) -> None:
+    _terminal_send(window_id, "clear && printf '\\033[3J'")
+    _terminal_wait_clean_prompt(window_id)
+
+
+def _capture_terminal_text(window_id: int, output: Path) -> str:
+    """Persist the real Terminal scrollback for Web recordings."""
+    text = _terminal_history(window_id)
+    if not text.strip():
+        raise SologsbError("无法抓取 Terminal 窗口文本: 空输出")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text if text.endswith("\n") else f"{text}\n", encoding="utf-8")
     return text
+
+
+def _app_bundle_id(pid: int) -> str:
+    try:
+        from AppKit import NSRunningApplication  # type: ignore
+
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
+        return str(app.bundleIdentifier() or "") if app is not None else ""
+    except Exception:
+        return ""
+
+
+def _canonical_owner(owner_name: str, bundle_id: str = "") -> str:
+    """Map localized owner names (e.g. "终端") and bundle IDs onto Terminal/Chrome."""
+    if bundle_id in RECORDING_WINDOW_BUNDLES:
+        return RECORDING_WINDOW_BUNDLES[bundle_id]
+    name = str(owner_name or "").strip()
+    if name in TERMINAL_OWNER_NAMES:
+        return "Terminal"
+    if name in {"Google Chrome", "Chrome"}:
+        return "Chrome"
+    return name
 
 
 def _window_info_payload(window: dict[str, Any]) -> dict[str, Any] | None:
@@ -239,59 +465,6 @@ def _frontmost_window_info() -> dict[str, Any] | None:
 
 
 
-def _raise_otty_window_by_title(title: str) -> bool:
-    """Raise a non-recording Otty window so the capture window stays unobtrusive."""
-    if not title:
-        return False
-    script_title = json.dumps(title)
-    proc = run(
-        [
-            "osascript",
-            "-e",
-            'tell application "System Events" to tell process "Otty" to set frontmost to true',
-            "-e",
-            f'tell application "System Events" to tell process "Otty" to perform action "AXRaise" of window {script_title}',
-        ],
-        check=False,
-        timeout=4,
-    )
-    return proc.returncode == 0
-
-
-class _OttyWindowFocusAnchor:
-    """Keep a non-recording Otty window in front while the capture target stays background."""
-
-    def __init__(self, helper_title: str, target_window_ids: set[int] | None = None) -> None:
-        self.helper_title = helper_title
-        self.target_window_ids = {int(value) for value in (target_window_ids or set()) if int(value) > 0}
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def add_target(self, window_id: int) -> None:
-        if int(window_id) > 0:
-            self.target_window_ids.add(int(window_id))
-
-    def _run(self) -> None:
-        while not self._stop.wait(0.1):
-            frontmost = _frontmost_window_info()
-            if frontmost is None:
-                continue
-            if int(frontmost.get("windowId") or 0) not in self.target_window_ids:
-                continue
-            _raise_otty_window_by_title(self.helper_title)
-
-    def start(self) -> None:
-        _raise_otty_window_by_title(self.helper_title)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.5)
-            self._thread = None
-
-
 def _live_recording_window(window_id: int) -> dict[str, Any] | None:
     for window in _window_list():
         try:
@@ -311,8 +484,11 @@ def _validate_recording_window(window_info: dict[str, Any]) -> dict[str, Any]:
     window_id = int(window_info.get("windowId") or 0)
     owner_pid = int(window_info.get("ownerPid") or 0)
     owner_name = str(window_info.get("ownerName") or "").strip()
-    if window_id <= 0 or owner_pid <= 0 or owner_name not in RECORDING_WINDOW_OWNERS:
-        raise SologsbError("窗口不在 Otty/Google Chrome 白名单内，停止录制")
+    allowed = owner_name in RECORDING_WINDOW_OWNERS or (
+        owner_pid > 0 and _app_bundle_id(owner_pid) in RECORDING_WINDOW_BUNDLES
+    )
+    if window_id <= 0 or owner_pid <= 0 or not allowed:
+        raise SologsbError("窗口不在 Terminal/Google Chrome 白名单内，停止录制")
     live = _live_recording_window(window_id)
     if live is None:
         raise SologsbError(
@@ -414,7 +590,7 @@ class _FocusRestoreGuard:
             event["skipReason"] = "original-app-already-frontmost"
             self.events.append(event)
             return event
-        if frontmost is None or frontmost_owner_pid not in targets:
+        if frontmost is None or frontmost_owner_pid not in self.recording_pids:
             event["skipReason"] = "frontmost-not-recording-process"
             self.events.append(event)
             return event
@@ -431,7 +607,7 @@ class _FocusRestoreGuard:
                 restored = bool(
                     current is not None
                     and current_window_id not in self.target_window_ids
-                    and (current_owner_pid not in targets or current_owner_pid == original_pid)
+                    and (current_owner_pid not in self.recording_pids or current_owner_pid == original_pid)
                 )
                 if restored:
                     break
@@ -552,24 +728,22 @@ def _require_window_id(window_info: dict[str, Any], label: str) -> dict[str, Any
     return window_info
 
 
-def _window_info_by_title(
-    title: str,
+def _window_info_by_id(
+    window_id: int,
     *,
-    owner: str = "Otty",
+    label: str = "Terminal",
     timeout: float = 10.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for window in _window_list():
-            if window.get("kCGWindowOwnerName") != owner:
-                continue
-            if str(window.get("kCGWindowName") or "") != title:
+            if int(window.get("kCGWindowNumber") or 0) != int(window_id):
                 continue
             payload = _window_info_payload(window)
             if payload:
-                return _require_window_id(payload, owner)
+                return _require_window_id(payload, label)
         time.sleep(0.25)
-    raise SologsbError(f"无法定位{owner}窗口ID，停止录制: {title}")
+    raise SologsbError(f"无法定位{label}窗口ID，停止录制: windowId={window_id}")
 
 
 _ACTIVE_CURSOR_GUARD: "_MouseCursorGuard | None" = None
@@ -914,6 +1088,7 @@ def _start_window_segment(
 
         _ACTIVE_WINDOW_CAPTURE = proc
         _ACTIVE_WINDOW_CAPTURE_LOG = handle
+        owner_bundle_id = _app_bundle_id(int(window_info["ownerPid"]))
         _ACTIVE_WINDOW_CAPTURE_STARTED = time.monotonic()
         watchdog = threading.Timer(
             WINDOW_CAPTURE_MAX_SECONDS,
@@ -935,6 +1110,8 @@ def _start_window_segment(
                 "windowId": int(window_info["windowId"]),
                 "ownerPid": int(window_info["ownerPid"]),
                 "ownerName": str(window_info["ownerName"]),
+                "ownerBundleId": owner_bundle_id,
+                "ownerApp": _canonical_owner(str(window_info["ownerName"]), owner_bundle_id),
                 "windowName": str(window_info["windowName"]),
                 "bounds": bounds,
                 "captureWidth": int(ready.get("width") or 0),
@@ -970,12 +1147,82 @@ def _start_window_segment(
         raise
 
 
+TERMINAL_VISUAL_FRAME_WIDTH = 80
+TERMINAL_VISUAL_FRAME_HEIGHT = 52
+TERMINAL_VISUAL_CROP = "700:500:300:100"
+TERMINAL_VISUAL_MIN_MEAN_STD = 3.0
+
+
+def _terminal_visual_content_metrics(video: Path) -> dict[str, Any]:
+    """Reject blank/static terminal recordings before they can be delivered."""
+    width = TERMINAL_VISUAL_FRAME_WIDTH
+    height = TERMINAL_VISUAL_FRAME_HEIGHT
+    frame_size = width * height
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(video),
+        "-vf",
+        f"fps=4,crop={TERMINAL_VISUAL_CROP},scale={width}:{height}:flags=area,format=gray",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    proc = run(command, check=False)
+    if proc.returncode != 0:
+        return {
+            "status": "failed",
+            "ok": False,
+            "error": proc.stderr.decode("utf-8", errors="replace").strip() or "ffmpeg 画面内容检测失败",
+            "minimumMeanStd": TERMINAL_VISUAL_MIN_MEAN_STD,
+        }
+    raw = proc.stdout
+    frame_count = len(raw) // frame_size
+    frames = [raw[i * frame_size:(i + 1) * frame_size] for i in range(frame_count)]
+    if len(frames) < 4:
+        return {
+            "status": "failed",
+            "ok": False,
+            "error": f"有效终端画面帧不足: {len(frames)}",
+            "frameCount": len(frames),
+            "minimumMeanStd": TERMINAL_VISUAL_MIN_MEAN_STD,
+        }
+    mean_stds: list[float] = []
+    frame_diffs: list[float] = []
+    for index, frame in enumerate(frames):
+        values = list(frame)
+        mean = sum(values) / len(values)
+        mean_stds.append((sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5)
+        if index:
+            previous = frames[index - 1]
+            frame_diffs.append(
+                sum(abs(a - b) for a, b in zip(frame, previous)) / frame_size
+            )
+    mean_std = sum(mean_stds) / len(mean_stds)
+    max_diff = max(frame_diffs) if frame_diffs else 0.0
+    ok = mean_std >= TERMINAL_VISUAL_MIN_MEAN_STD
+    return {
+        "status": "ok" if ok else "failed",
+        "ok": ok,
+        "frameCount": len(frames),
+        "meanStd": round(mean_std, 4),
+        "maxFrameDiff": round(max_diff, 4),
+        "minimumMeanStd": TERMINAL_VISUAL_MIN_MEAN_STD,
+        "crop": TERMINAL_VISUAL_CROP,
+        "scale": f"{width}x{height}",
+        "error": "" if ok else "终端录屏没有可辨识内容，疑似空白或未渲染画面",
+    }
+
+
 def _stop_window_segment(
     *,
     raw: Path,
     cropped: Path,
     window_info: dict[str, Any],
     pid_file: Path,
+    require_visible_content: bool = False,
 ) -> None:
     global _ACTIVE_WINDOW_CAPTURE, _ACTIVE_WINDOW_CAPTURE_LOG, _ACTIVE_WINDOW_CAPTURE_WATCHDOG, _ACTIVE_WINDOW_CAPTURE_STARTED
     proc = _ACTIVE_WINDOW_CAPTURE
@@ -1026,17 +1273,9 @@ def _stop_window_segment(
             "-i",
             str(raw),
             "-vf",
-            "scale=1280:720:force_original_aspect_ratio=decrease,"
-            "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30",
+            f"{VIDEO_SCALE_FILTER},fps=30",
             "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
+            *INTERMEDIATE_X264_ARGS,
             "-movflags",
             "+faststart",
             str(cropped),
@@ -1047,6 +1286,18 @@ def _stop_window_segment(
         raise SologsbError(
             transcode.stderr.decode("utf-8", errors="replace") or "窗口视频转码失败"
         )
+    visual_report: dict[str, Any] = {"required": require_visible_content, "status": "skipped", "ok": True}
+    if require_visible_content:
+        visual_report = _terminal_visual_content_metrics(cropped)
+        write_json(
+            cropped.with_name(f"{cropped.stem}-visual-content.json"),
+            visual_report,
+        )
+        if not visual_report.get("ok"):
+            raise SologsbError(
+                "终端录屏画面门禁未通过: "
+                + str(visual_report.get("error") or "没有可辨识内容")
+            )
     metadata_path = raw.with_name(f"{raw.stem}-window-capture.json")
     metadata = read_json(metadata_path, {}) or {}
     backend_ok = (
@@ -1061,6 +1312,7 @@ def _stop_window_segment(
             "finishedAt": utc_now(),
             "outputPath": str(cropped.resolve()),
             "pidFile": str(pid_file.resolve()),
+            "visualContent": visual_report,
         }
     )
     write_json(metadata_path, metadata)
@@ -1115,12 +1367,9 @@ def _concat_segments(parts: list[Path], output: Path) -> None:
         cmd += ["-i", str(part)]
     filters = []
     for index in range(len(parts)):
-        filters.append(
-            f"[{index}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30[v{index}]"
-        )
+        filters.append(f"[{index}:v]{VIDEO_SCALE_FILTER},fps=30[v{index}]")
     concat = "".join(f"[v{index}]" for index in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[out]"
-    proc = run([*cmd, "-filter_complex", ";".join([*filters, concat]), "-map", "[out]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)], check=False)
+    proc = run([*cmd, "-filter_complex", ";".join([*filters, concat]), "-map", "[out]", *INTERMEDIATE_X264_ARGS, "-movflags", "+faststart", str(output)], check=False)
     if proc.returncode != 0:
         raise SologsbError(proc.stderr.decode("utf-8", errors="replace") or "视频片段拼接失败")
 
@@ -1449,9 +1698,9 @@ def default_plan(task_root: Path, side: str) -> dict[str, Any]:
             "startCommand": "pnpm dev" if package_manager == "pnpm" else "npm run dev",
             "appUrl": f"http://127.0.0.1:{_dev_port(str(scripts.get('dev') or ''), 5173)}",
             "scenarioScript": scenario,
-            "terminalApp": "otty",
+            "terminalApp": TERMINAL_APP,
             "pace": 1.8,
-            "targetApps": ["Otty", "Chrome"],
+            "targetApps": ["Terminal", "Chrome"],
             "captureKind": "window-id",
             "pointerStrategy": "none",
             "buildCommands": preflight,
@@ -1465,9 +1714,9 @@ def default_plan(task_root: Path, side: str) -> dict[str, Any]:
             "startCommand": "pnpm start" if package_manager == "pnpm" else "npm start",
             "appUrl": "http://127.0.0.1:3000",
             "scenarioScript": scenario,
-            "terminalApp": "otty",
+            "terminalApp": TERMINAL_APP,
             "pace": 1.8,
-            "targetApps": ["Otty", "Chrome"],
+            "targetApps": ["Terminal", "Chrome"],
             "captureKind": "window-id",
             "pointerStrategy": "none",
             "buildCommands": preflight,
@@ -1492,9 +1741,9 @@ def default_plan(task_root: Path, side: str) -> dict[str, Any]:
         "apiRequests": [],
         "requiresApiRequests": backend_project,
         "holdSeconds": 12,
-        "terminalApp": "otty",
+        "terminalApp": TERMINAL_APP,
         "expectedFailure": False,
-        "targetApps": ["Otty"],
+        "targetApps": ["Terminal"],
         "captureKind": "window-id",
         "pointerStrategy": "none",
         "outputName": recording_output_name(task_root, side),
@@ -1595,12 +1844,26 @@ def recording_isolation_ok(
     window_capture_ok = bool(window_capture_reports) and all(
         valid_capture(item) for item in window_capture_reports
     )
+    terminal_visual_ok = True
+    if mode in {"terminal", "failed-start"}:
+        for item in window_capture_reports:
+            report: dict[str, Any] = {}
+            report_path = str(item.get("path") or "").strip()
+            if report_path:
+                report = read_json(Path(report_path), {}) or {}
+            visual = item.get("visualContent") or report.get("visualContent")
+            output_path = str(report.get("outputPath") or item.get("outputPath") or "").strip()
+            if not isinstance(visual, dict) and output_path and Path(output_path).is_file():
+                visual = _terminal_visual_content_metrics(Path(output_path))
+            if not isinstance(visual, dict) or visual.get("ok") is not True:
+                terminal_visual_ok = False
+                break
     owners = {
-        "Chrome" if str(item.get("ownerName") or "").strip() == "Google Chrome"
-        else str(item.get("ownerName") or "").strip()
+        str(item.get("ownerApp") or "").strip()
+        or _canonical_owner(str(item.get("ownerName") or ""), str(item.get("ownerBundleId") or ""))
         for item in window_capture_reports
     }
-    expected_owners = {"Otty", "Chrome"} if mode == "web" else {"Otty"}
+    expected_owners = {"Terminal", "Chrome"} if mode == "web" else {"Terminal"}
     targets_ok = owners == expected_owners
 
     def valid_guard(item: dict[str, Any]) -> bool:
@@ -1628,7 +1891,14 @@ def recording_isolation_ok(
             service_cleanup.get("status") == "ok"
             and not (service_cleanup.get("residualAppPortListeners") or [])
         )
-    return targets_ok and window_capture_ok and cursor_ok and frontmost_ok and service_ok
+    return (
+        targets_ok
+        and window_capture_ok
+        and terminal_visual_ok
+        and cursor_ok
+        and frontmost_ok
+        and service_ok
+    )
 
 
 def _copy_final(source: Path, task_root: Path, side: str, output_name: str) -> Path:
@@ -1639,9 +1909,8 @@ def _copy_final(source: Path, task_root: Path, side: str, output_name: str) -> P
     proc = run(
         [
             "ffmpeg", "-y", "-v", "error", "-i", str(source),
-            "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
-            "-r", "30", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temp),
+            "-vf", VIDEO_SCALE_FILTER,
+            "-r", "30", "-an", *FINAL_X264_ARGS, "-movflags", "+faststart", str(temp),
         ],
         check=False,
     )
@@ -1679,6 +1948,66 @@ def _playwright_node_path(output_dir: Path) -> str:
     return str(tools / "node_modules")
 
 
+CHROME_FLAGS = [
+    "--no-first-run", "--no-default-browser-check", "--lang=en-US", "--accept-lang=en-US,en", "--disable-translate", "--disable-component-extensions-with-background-pages",
+    "--disable-save-password-bubble", "--password-store=basic",
+    "--disable-sync", "--disable-background-networking", "--disable-component-update",
+    "--disable-default-apps", "--disable-extensions", "--disable-search-engine-choice-screen",
+    "--hide-crash-restore-bubble", "--no-service-autorun", "--no-report-upload",
+    "--disable-features=Translate,TranslateUI,PasswordManager,PasswordManagerOnboarding,PasswordManagerEnableAccountStore,PasswordManagerRedesign,PasswordGeneration,PasswordLeakDetection,PasswordStrengthIndicator,PasswordManagerEnableBiometricAuthentication,AutofillServerCommunication,AutofillEnableAccountWalletStorage,AutofillEnablePayments,AutofillEnableOfferToSaveCard,AutofillEnableSyncingAutofill,AutofillEnableVirtualCard,AutofillEnableCardBenefits,AutofillEnableCardArtImage,AutofillUpstream,AutofillEnablePaymentsMandatoryReauth,AutofillEnableSaveCardBubble,AutofillSaveCardBubble,AutofillEnableWalletMetadataPayment,AutofillDisableAddressSaving,EnablePasswordsAccountStorage,SafeBrowsingEnhancedProtection,SigninPromo,DiceWebSigninInterception,ChromeSignin,AccountConsistency,ProfileMenuRevamp,ProfileCustomization,ProfilePickerOnStartup",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+]
+
+# Creates the recording window through CDP with background:true so Chrome never
+# becomes the frontmost app (a startup window or `open` would activate it).
+CHROME_BACKGROUND_WINDOW_JS = """
+const [wsUrl, left, top, width, height] = process.argv.slice(1);
+const ws = new WebSocket(wsUrl);
+const timer = setTimeout(() => { console.error('CDP 超时'); process.exit(2); }, 15000);
+ws.onopen = () => ws.send(JSON.stringify({id: 1, method: 'Target.createTarget', params: {url: 'about:blank', newWindow: true, background: true, left: +left, top: +top, width: +width, height: +height}}));
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.id !== 1) return;
+  clearTimeout(timer);
+  if (msg.error) { console.error(JSON.stringify(msg.error)); process.exit(1); }
+  console.log(msg.result.targetId);
+  ws.close();
+  process.exit(0);
+};
+ws.onerror = (e) => { console.error(String(e.message || e)); process.exit(1); };
+"""
+
+
+def _chrome_command(profile: Path, port: int) -> list[str]:
+    """Run the Chrome binary directly: no LaunchServices activation, no startup window."""
+    return [
+        str(CHROME_BINARY),
+        f"--user-data-dir={profile}",
+        f"--remote-debugging-port={port}",
+        *CHROME_FLAGS,
+        "--no-startup-window",
+    ]
+
+
+def _chrome_open_background_window(ws_url: str) -> str:
+    if not ws_url:
+        raise SologsbError("Chrome CDP 没有返回 webSocketDebuggerUrl")
+    left, top, width, height = CHROME_WINDOW_BOUNDS
+    proc = run(
+        ["node", "--experimental-websocket", "-e", CHROME_BACKGROUND_WINDOW_JS, ws_url, str(left), str(top), str(width), str(height)],
+        check=False,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise SologsbError(
+            "无法在后台创建 Chrome 窗口: "
+            + (proc.stderr.decode("utf-8", errors="replace").strip() or str(proc.returncode))
+        )
+    return proc.stdout.decode("utf-8", errors="replace").strip()
+
+
 def _record_chrome_segment(
     *,
     output_dir: Path,
@@ -1688,11 +2017,9 @@ def _record_chrome_segment(
     pointer_strategy: str,
     focus_guard: _FocusRestoreGuard,
     frontmost_monitor: _FrontmostWindowMonitor,
-    focus_anchor: _OttyWindowFocusAnchor | None = None,
 ) -> tuple[Path, int]:
-    chrome = Path("/Applications/Google Chrome.app")
-    if not chrome.exists():
-        raise SologsbError("缺少 Google Chrome")
+    if not CHROME_BINARY.is_file():
+        raise SologsbError(f"缺少 Google Chrome: {CHROME_BINARY}")
     raw = output_dir / "browser-screen.mov"
     cropped = output_dir / "browser-cropped.mp4"
     pid_file = output_dir / "browser.pid"
@@ -1744,44 +2071,36 @@ def _record_chrome_segment(
     port = random.randrange(9300, 9900)
     cdp_url = f"http://127.0.0.1:{port}"
     chrome_pids: list[int] = []
+    chrome_proc: subprocess.Popen[bytes] | None = None
+    chrome_log = (output_dir / "chrome.log").open("wb")
     try:
-        run([
-            "open", "-g", "-na", "Google Chrome", "--args",
-            f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
-            "--no-first-run", "--no-default-browser-check", "--lang=en-US", "--accept-lang=en-US,en", "--disable-translate", "--disable-component-extensions-with-background-pages",
-            "--disable-save-password-bubble", "--password-store=basic",
-            "--disable-sync", "--disable-background-networking", "--disable-component-update",
-            "--disable-default-apps", "--disable-extensions", "--disable-search-engine-choice-screen",
-            "--hide-crash-restore-bubble", "--no-service-autorun", "--no-report-upload",
-            "--disable-features=Translate,TranslateUI,PasswordManager,PasswordManagerOnboarding,PasswordManagerEnableAccountStore,PasswordManagerRedesign,PasswordGeneration,PasswordLeakDetection,PasswordStrengthIndicator,PasswordManagerEnableBiometricAuthentication,AutofillServerCommunication,AutofillEnableAccountWalletStorage,AutofillEnablePayments,AutofillEnableOfferToSaveCard,AutofillEnableSyncingAutofill,AutofillEnableVirtualCard,AutofillEnableCardBenefits,AutofillEnableCardArtImage,AutofillUpstream,AutofillEnablePaymentsMandatoryReauth,AutofillEnableSaveCardBubble,AutofillSaveCardBubble,AutofillEnableWalletMetadataPayment,AutofillDisableAddressSaving,EnablePasswordsAccountStorage,SafeBrowsingEnhancedProtection,SigninPromo,DiceWebSigninInterception,ChromeSignin,AccountConsistency,ProfileMenuRevamp,ProfileCustomization,ProfilePickerOnStartup",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-background-timer-throttling",
-            "--window-size=1440,900", "--window-position=40,40", "--new-window", "about:blank",
-        ])
+        chrome_proc = subprocess.Popen(
+            _chrome_command(profile, port),
+            stdin=subprocess.DEVNULL,
+            stdout=chrome_log,
+            stderr=subprocess.STDOUT,
+        )
         deadline = time.monotonic() + 30
+        version: dict[str, Any] = {}
         while time.monotonic() < deadline:
+            if chrome_proc.poll() is not None:
+                raise SologsbError(f"Chrome 提前退出({chrome_proc.returncode})，详见 {output_dir / 'chrome.log'}")
             try:
-                with urlopen(cdp_url + "/json/version", timeout=2):
+                with urlopen(cdp_url + "/json/version", timeout=2) as response:
+                    version = json.loads(response.read().decode("utf-8"))
                     break
             except Exception:
                 time.sleep(0.25)
         else:
             raise SologsbError("Chrome CDP 未启动")
-        pid_proc = run(["pgrep", "-f", str(profile)], check=False)
-        if pid_proc.returncode != 0 or not pid_proc.stdout.strip():
-            raise SologsbError("无法定位独立 Chrome 进程")
-        chrome_pids = [
-            int(value)
-            for value in pid_proc.stdout.decode("utf-8", errors="replace").splitlines()
-            if value.strip().isdigit()
-        ]
-        if not chrome_pids:
-            raise SologsbError("无法解析独立 Chrome 进程 PID")
+        chrome_pids = [chrome_proc.pid]
+        _chrome_open_background_window(str(version.get("webSocketDebuggerUrl") or ""))
         window_info = _window_info_for_pids(chrome_pids, label="Chrome")
-        if focus_anchor is not None:
-            focus_anchor.add_target(int(window_info.get("windowId") or 0))
-        focus_guard.restore_if_recording_frontmost(set(chrome_pids), "chrome-open")
+        focus_guard.restore_if_recording_frontmost(
+            set(chrome_pids),
+            "chrome-open",
+            {int(window_info.get("windowId") or 0)},
+        )
         node_path = _playwright_node_path(output_dir)
         _start_window_segment(
             output=raw,
@@ -1802,7 +2121,7 @@ def _record_chrome_segment(
                 }
             )
             proc = run(
-                ["node", str(OTTY_BROWSER_DRIVER), "--scenario", str(scenario), "--output", str(output_dir)],
+                ["node", str(BROWSER_DRIVER), "--scenario", str(scenario), "--output", str(output_dir)],
                 env=env,
                 check=False,
                 timeout=180,
@@ -1817,14 +2136,19 @@ def _record_chrome_segment(
             )
         return cropped, proc.returncode
     finally:
-        for pid in chrome_pids:
-            run(["kill", str(pid)], check=False)
+        if chrome_proc is not None and chrome_proc.poll() is None:
+            chrome_proc.terminate()
+            try:
+                chrome_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                chrome_proc.kill()
         run(["pkill", "-f", str(profile)], check=False)
+        chrome_log.close()
         time.sleep(0.5)
         _remove_chrome_profile(profile, output_dir / "chrome-profile-cleanup.json")
 
 
-def _run_web_otty(
+def _run_web_terminal(
     task_root: Path,
     side: str,
     plan: dict[str, Any],
@@ -1836,7 +2160,7 @@ def _run_web_otty(
     scenario = Path(str(plan.get("scenarioScript") or ""))
     if not scenario.is_file():
         raise SologsbError(f"Web scenario 不存在: {scenario}")
-    output_dir = task_root / "monitor" / "recording" / side.lower() / "web-otty"
+    output_dir = task_root / "monitor" / "recording" / side.lower() / WEB_RUNTIME_DIR
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1844,85 +2168,66 @@ def _run_web_otty(
     terminal_cropped = output_dir / "terminal-cropped.mp4"
     terminal_pid = output_dir / "terminal.pid"
     title = f"sologsb-{side.lower()}-{random.randrange(0x100000):05x}"
-    window_id = ""
-    helper_window_id = ""
-    pane_id = ""
-    focus_anchor: _OttyWindowFocusAnchor | None = None
+    window_id = 0
+    tty = ""
     browser_exit = 0
     combined: Path | None = None
     body_error: BaseException | None = None
     capture_error: Exception | None = None
-    with _otty_send_keys_enabled():
+    try:
+        window_id, tty = _terminal_open_window(title, Path(str(plan["projectDir"])).resolve())
+        window_info = _window_info_by_id(window_id, label="Terminal")
+        focus_guard.restore_if_recording_frontmost(
+            {int(window_info.get("ownerPid") or 0)},
+            "terminal-open",
+            {window_id},
+        )
+        precommands = [str(command) for command in plan.get("preCommands") or [] if str(command).strip()]
+        for command in precommands:
+            _terminal_send(window_id, command)
+            time.sleep(0.3)
+        if precommands:
+            # preCommands run off camera; wipe their output before capture starts.
+            _terminal_prepare_clean(window_id)
+        _start_window_segment(
+            output=terminal_raw,
+            pid_file=terminal_pid,
+            window_info=window_info,
+            pointer_strategy=pointer_strategy,
+            frontmost_monitor=frontmost_monitor,
+        )
         try:
-            run(["open", "-g", "-a", "Otty"], check=False)
-            time.sleep(2.0)
-            window_id, pane_id = _otty_open_window(title, Path(str(plan["projectDir"])).resolve())
-            _otty_call(["config", "reload", "--json"], check=False)
-            window_info = _window_info_by_title(title)
-            helper_window_id, _helper_pane_id = _otty_open_window(
-                f"{title}-guard",
-                Path(str(plan["projectDir"])).resolve(),
-            )
-            focus_guard.restore_if_recording_frontmost(
-                {int(window_info.get("ownerPid") or 0)},
-                "otty-open",
-                {int(window_info.get("windowId") or 0)},
-            )
-            focus_anchor = _OttyWindowFocusAnchor(
-                f"{title}-guard",
-                {int(window_info.get("windowId") or 0)},
-            )
-            focus_anchor.start()
-            for command in plan.get("preCommands") or []:
-                _otty_send(pane_id, str(command))
-                time.sleep(0.3)
-            # Sanitize the prompt and clear before recording so absolute paths never appear.
-            _otty_send(pane_id, "export PS1='sologsb %1~ %# '")
-            _otty_send(pane_id, "clear")
-            time.sleep(0.5)
-            _start_window_segment(
-                output=terminal_raw,
-                pid_file=terminal_pid,
-                window_info=window_info,
-                pointer_strategy=pointer_strategy,
-                frontmost_monitor=frontmost_monitor,
-            )
-            try:
-                _otty_send(pane_id, str(plan["startCommand"]))
-                if not _wait_url(str(plan["appUrl"]), timeout=float(plan.get("startTimeoutSeconds") or 45)):
-                    raise SologsbError(f"项目未在时限内可访问: {plan['appUrl']}")
-                time.sleep(float(plan.get("terminalHoldSeconds") or 2))
-            finally:
-                _stop_window_segment(
-                    raw=terminal_raw,
-                    cropped=terminal_cropped,
-                    window_info=window_info,
-                    pid_file=terminal_pid,
-                )
-            browser_cropped, browser_exit = _record_chrome_segment(
-                output_dir=output_dir,
-                app_url=str(plan["appUrl"]),
-                scenario=scenario,
-                pace=float(plan.get("pace") or 1.4),
-                pointer_strategy=pointer_strategy,
-                focus_guard=focus_guard,
-                frontmost_monitor=frontmost_monitor,
-                focus_anchor=focus_anchor,
-            )
-            combined = output_dir / "combined.mp4"
-            _concat_segments([terminal_cropped, browser_cropped], combined)
-        except BaseException as exc:
-            body_error = exc
+            _terminal_send(window_id, str(plan["startCommand"]))
+            if not _wait_url(str(plan["appUrl"]), timeout=float(plan.get("startTimeoutSeconds") or 45)):
+                raise SologsbError(f"项目未在时限内可访问: {plan['appUrl']}")
+            time.sleep(float(plan.get("terminalHoldSeconds") or 2))
         finally:
-            if pane_id:
-                try:
-                    _capture_otty_pane_text(pane_id, output_dir / "terminal.log", lines=400)
-                except Exception as exc:
-                    capture_error = exc
-            if focus_anchor is not None:
-                focus_anchor.stop()
-            _otty_close_window(helper_window_id)
-            _otty_close_window(window_id)
+            _stop_window_segment(
+                raw=terminal_raw,
+                cropped=terminal_cropped,
+                window_info=window_info,
+                pid_file=terminal_pid,
+            )
+        browser_cropped, browser_exit = _record_chrome_segment(
+            output_dir=output_dir,
+            app_url=str(plan["appUrl"]),
+            scenario=scenario,
+            pace=float(plan.get("pace") or 1.4),
+            pointer_strategy=pointer_strategy,
+            focus_guard=focus_guard,
+            frontmost_monitor=frontmost_monitor,
+        )
+        combined = output_dir / "combined.mp4"
+        _concat_segments([terminal_cropped, browser_cropped], combined)
+    except BaseException as exc:
+        body_error = exc
+    finally:
+        if window_id:
+            try:
+                _capture_terminal_text(window_id, output_dir / "terminal.log")
+            except Exception as exc:
+                capture_error = exc
+            _terminal_close_window(window_id, tty)
     if body_error is not None:
         raise body_error
     if capture_error is not None:
@@ -2080,7 +2385,7 @@ def validate_api_requests(plan: dict[str, Any]) -> list[dict[str, Any]]:
     if not raw and plan.get("requiresApiRequests"):
         raise SologsbError(
             "纯后端/API 录制必须在 record-plan.json.apiRequests 中至少配置一个真实请求，"
-            "用于在 Otty 中模拟 API 调用并展示响应"
+            "用于在终端中模拟 API 调用并展示响应"
         )
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(raw, 1):
@@ -2155,6 +2460,30 @@ def _api_request_shell(item: dict[str, Any], timeout: float = 20.0) -> str:
     return " ".join(parts)
 
 
+# Commands typed into the recorded Terminal show up verbatim in the video, so
+# anything that would print credentials or env vars is refused up front.
+VISIBLE_COMMAND_DENYLIST = (
+    (re.compile(r"(?:^|[\s;&|(])(?:env|printenv|set|export\s+-p|history)(?:\s*$|\s*[;&|)])"), "打印环境变量或历史命令"),
+    (re.compile(r"\b(?:cat|less|more|head|tail|bat|nl|grep|rg|awk|sed|strings|xxd|od|jq)\b[^;&|]*(?:^|/|\s)\.env(?:\.[\w.-]+)?(?:\s|$|[;&|)'\"])"), "显示 .env 文件内容"),
+    (re.compile(r"\.codex/sologsb|\.ssh/|\.aws/|\.kube/|\.netrc|\.npmrc|\.git-credentials|id_rsa|id_ed25519"), "读取凭据文件"),
+    (re.compile(r"(?i)\b(?:sk-(?:ant-)?[\w-]{16,}|ghp_\w{20,}|glpat-[\w-]{16,}|AKIA[0-9A-Z]{16})"), "明文 Key/Token"),
+    (re.compile(r"\$\{?(?:SOLOSB_CLAUDE_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|GITHUB_TOKEN)\b"), "回显凭据环境变量"),
+)
+
+
+def assert_visible_commands_safe(plan: dict[str, Any]) -> None:
+    visible = [str(plan.get("startCommand") or ""), *[str(item) for item in plan.get("commands") or []]]
+    for request in plan.get("apiRequests") or []:
+        if isinstance(request, dict):
+            visible.append(str(request.get("url") or ""))
+            visible.extend(f"{key}: {value}" for key, value in (request.get("headers") or {}).items())
+            visible.append(json.dumps(request.get("body"), ensure_ascii=False))
+    for command in visible:
+        for pattern, reason in VISIBLE_COMMAND_DENYLIST:
+            if pattern.search(command):
+                raise SologsbError(f"录屏终端命令会{reason}，画面会原样录进视频，请修改录制计划: {command[:120]}")
+
+
 def _terminal_command(plan: dict[str, Any], log_path: Path, script_path: Path, result_path: Path) -> str:
     start = str(plan.get("startCommand") or "").strip()
     if not start:
@@ -2221,7 +2550,7 @@ def _finalize_terminal_video(
     return _copy_final(cropped, task_root, side, output_name), exit_code
 
 
-def _run_terminal_otty(
+def _run_terminal_app(
     task_root: Path,
     side: str,
     plan: dict[str, Any],
@@ -2230,7 +2559,7 @@ def _run_terminal_otty(
     focus_guard: _FocusRestoreGuard,
     frontmost_monitor: _FrontmostWindowMonitor,
 ) -> tuple[Path, int | None]:
-    output_dir = task_root / "monitor" / "recording" / side.lower() / "terminal-otty"
+    output_dir = task_root / "monitor" / "recording" / side.lower() / TERMINAL_RUNTIME_DIR
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2241,54 +2570,41 @@ def _run_terminal_otty(
     result_path = output_dir / "exit-code.txt"
     pid_file = output_dir / "screen.pid"
     title = f"sologsb-{side.lower()}-{random.randrange(0x100000):05x}"
-    window_id = ""
-    helper_window_id = ""
-    focus_anchor: _OttyWindowFocusAnchor | None = None
-    with _otty_send_keys_enabled():
+    window_id = 0
+    tty = ""
+    try:
+        window_id, tty = _terminal_open_window(title, Path(str(plan["projectDir"])).resolve())
+        window_info = _window_info_by_id(window_id, label="Terminal")
+        focus_guard.restore_if_recording_frontmost(
+            {int(window_info.get("ownerPid") or 0)},
+            "terminal-open",
+            {window_id},
+        )
+        _start_window_segment(
+            output=raw,
+            pid_file=pid_file,
+            window_info=window_info,
+            pointer_strategy=pointer_strategy,
+            frontmost_monitor=frontmost_monitor,
+        )
         try:
-            window_id, pane_id = _otty_open_window(title, Path(str(plan["projectDir"])).resolve())
-            _otty_call(["config", "reload", "--json"], check=False)
-            window_info = _window_info_by_title(title)
-            helper_window_id, _helper_pane_id = _otty_open_window(
-                f"{title}-guard",
-                Path(str(plan["projectDir"])).resolve(),
-            )
-            focus_guard.restore_if_recording_frontmost(
-                {int(window_info.get("ownerPid") or 0)},
-                "otty-open",
-                {int(window_info.get("windowId") or 0)},
-            )
-            focus_anchor = _OttyWindowFocusAnchor(
-                f"{title}-guard",
-                {int(window_info.get("windowId") or 0)},
-            )
-            focus_anchor.start()
-            _start_window_segment(
-                output=raw,
-                pid_file=pid_file,
-                window_info=window_info,
-                pointer_strategy=pointer_strategy,
-                frontmost_monitor=frontmost_monitor,
-            )
-            try:
-                for command in plan.get("preCommands") or []:
-                    _otty_send(pane_id, str(command))
-                    time.sleep(0.4)
-                command = _terminal_command(plan, log_path, runner_script, result_path)
-                _otty_send(pane_id, command)
-                time.sleep(float(plan.get("holdSeconds") or 12))
-            finally:
-                _stop_window_segment(
-                    raw=raw,
-                    cropped=cropped,
-                    window_info=window_info,
-                    pid_file=pid_file,
-                )
+            for command in plan.get("preCommands") or []:
+                _terminal_send(window_id, str(command))
+                time.sleep(0.4)
+            command = _terminal_command(plan, log_path, runner_script, result_path)
+            _terminal_send(window_id, command)
+            time.sleep(float(plan.get("holdSeconds") or 12))
         finally:
-            if focus_anchor is not None:
-                focus_anchor.stop()
-            _otty_close_window(helper_window_id)
-            _otty_close_window(window_id)
+            _stop_window_segment(
+                raw=raw,
+                cropped=cropped,
+                window_info=window_info,
+                pid_file=pid_file,
+                require_visible_content=True,
+            )
+    finally:
+        if window_id:
+            _terminal_close_window(window_id, tty)
     return _finalize_terminal_video(
         task_root=task_root,
         side=side,
@@ -2308,9 +2624,9 @@ def _run_terminal(
     focus_guard: _FocusRestoreGuard,
     frontmost_monitor: _FrontmostWindowMonitor,
 ) -> tuple[Path, int | None]:
-    if terminal_app != "otty":
-        raise SologsbError("录屏硬门禁要求终端应用必须是 Otty")
-    return _run_terminal_otty(
+    if normalize_terminal_app(terminal_app) != TERMINAL_APP:
+        raise SologsbError("录屏硬门禁要求终端应用必须是 Terminal.app")
+    return _run_terminal_app(
         task_root,
         side,
         plan,
@@ -2320,11 +2636,30 @@ def _run_terminal(
     )
 
 
-def validate_recording_targets(mode: str, targets: Any, terminal_app: str = "otty") -> list[str]:
-    values = list(targets or [])
-    if terminal_app != "otty":
-        raise SologsbError("录屏硬门禁要求终端应用必须是 Otty")
-    terminal_name = "Otty"
+def normalize_terminal_app(value: Any) -> str:
+    """Terminal.app is the only recording terminal; legacy "otty" plans map onto it."""
+    requested = str(value or "").strip().lower()
+    if requested in TERMINAL_APP_ALIASES:
+        return TERMINAL_APP
+    raise SologsbError(f"录屏硬门禁要求 terminalApp=terminal（Terminal.app），当前为: {value!r}")
+
+
+def normalize_recording_targets(targets: Any) -> list[str]:
+    normalized: list[str] = []
+    for value in list(targets or []):
+        name = str(value or "").strip()
+        if name in TERMINAL_TARGET_ALIASES:
+            name = "Terminal"
+        elif name == "Google Chrome":
+            name = "Chrome"
+        normalized.append(name)
+    return normalized
+
+
+def validate_recording_targets(mode: str, targets: Any, terminal_app: str = TERMINAL_APP) -> list[str]:
+    normalize_terminal_app(terminal_app)
+    values = normalize_recording_targets(targets)
+    terminal_name = "Terminal"
     if mode == "web":
         if set(values) != {terminal_name, "Chrome"}:
             raise SologsbError(f"Web 录屏只能包含 {terminal_name} 和 Chrome")
@@ -2334,7 +2669,7 @@ def validate_recording_targets(mode: str, targets: Any, terminal_app: str = "ott
             raise SologsbError(f"终端或失败录屏只能包含 {terminal_name}")
         return [terminal_name]
     if mode == "desktop":
-        raise SologsbError("禁止录制桌面应用，必须使用 Otty/Chrome 窗口 ID")
+        raise SologsbError("禁止录制桌面应用，必须使用 Terminal/Chrome 窗口 ID")
     raise SologsbError(f"未知录制模式: {mode}")
 
 
@@ -2349,7 +2684,8 @@ def _record_side_locked(
     _run_recording_preflight(task_root, side, draft)
     draft["outputName"] = recording_output_name(task_root, side)
     mode = str(draft.get("mode") or "")
-    terminal_app = str(draft.get("terminalApp") or "otty").lower()
+    terminal_app = normalize_terminal_app(draft.get("terminalApp"))
+    draft["terminalApp"] = terminal_app
     capture_kind = str(draft.get("captureKind") or "window-id")
     pointer_strategy = normalize_pointer_strategy(draft.get("pointerStrategy"))
     draft["pointerStrategy"] = pointer_strategy
@@ -2357,8 +2693,6 @@ def _record_side_locked(
         raise SologsbError("录屏硬门禁要求 captureKind=window-id")
     if pointer_strategy not in POINTER_POLICIES:
         raise SologsbError("pointerStrategy 只能是 none")
-    if terminal_app != "otty":
-        raise SologsbError("录屏硬门禁要求 terminalApp=otty")
     recording_root = task_root / "monitor" / "recording" / side.lower()
     frontmost_report_path = recording_root / "frontmost-window-monitor.json"
     service_cleanup_path = recording_root / "service-cleanup.json"
@@ -2371,22 +2705,25 @@ def _record_side_locked(
     service_cleanup: dict[str, Any] = {}
     video: Path
     command_exit: int | None
+    terminal_launched = False
     try:
         with contextlib.nullcontext():
-            # The recording target must start from the allowed Otty app; this also
-            # prevents any accidental focus-restore attempt against ChatGPT/Codex.
-            run(["open", "-a", "Otty"], check=False)
-            time.sleep(1.0)
+            # Capture the user's app before anything is launched, so a focus
+            # restore always returns to what the user was actually using.
             focus_guard = _FocusRestoreGuard()
             frontmost_monitor.start()
+            if mode in {"web", "terminal", "failed-start"}:
+                _terminal_write_profile_prefs()
+                terminal_launched = _terminal_ensure_ready()
+                _terminal_ensure_profile()
             if mode == "web":
-                default_targets = ["Otty", "Chrome"]
+                default_targets = ["Terminal", "Chrome"]
                 validate_recording_targets(mode, draft.get("targetApps") or default_targets, terminal_app)
                 if CHECK_ENV.is_file():
                     check = run(["/bin/bash", str(CHECK_ENV)], check=False, timeout=120)
                     if check.returncode != 0:
                         raise SologsbError(check.stderr.decode("utf-8", errors="replace") or "录屏环境检查失败")
-                video, command_exit = _run_web_otty(
+                video, command_exit = _run_web_terminal(
                     task_root,
                     side,
                     draft,
@@ -2395,7 +2732,7 @@ def _record_side_locked(
                     frontmost_monitor=frontmost_monitor,
                 )
             elif mode in {"terminal", "failed-start"}:
-                default_targets = ["Otty"]
+                default_targets = ["Terminal"]
                 validate_recording_targets(mode, draft.get("targetApps") or default_targets, terminal_app)
                 validate_api_requests(draft)
                 video, command_exit = _run_terminal(
@@ -2411,6 +2748,7 @@ def _record_side_locked(
                 validate_recording_targets(mode, draft.get("targetApps") or [], terminal_app)
                 raise SologsbError(f"未知录制模式: {mode}")
     finally:
+        _terminal_quit_if_launched(terminal_launched)
         frontmost_report = frontmost_monitor.stop()
         service_cleanup = _cleanup_recording_services(
             plan=draft,
@@ -2423,12 +2761,12 @@ def _record_side_locked(
     expected_app_failure = mode == "failed-start" or bool(draft.get("expectedBrowserFailure"))
     observed_app_failure = command_exit not in (None, 0)
     command_ok = recording_command_ok(command_exit, expected_app_failure)
-    runtime_dir = task_root / "monitor" / "recording" / side.lower() / ("web-otty" if mode == "web" else "terminal-otty")
+    runtime_dir = task_root / "monitor" / "recording" / side.lower() / (WEB_RUNTIME_DIR if mode == "web" else TERMINAL_RUNTIME_DIR)
     browser_result_path = runtime_dir / "browser-result.json"
     terminal_log_path = runtime_dir / "terminal.log"
     guard_reports = []
     window_capture_reports = []
-    for guard_path in sorted(recording_root.rglob("*-cursor-guard.json")):
+    for guard_path in sorted(runtime_dir.rglob("*-cursor-guard.json")):
         report = read_json(guard_path, {}) or {}
         guard_reports.append(
             {
@@ -2452,7 +2790,7 @@ def _record_side_locked(
                 "finalPointerInsideWindow": report.get("finalPointerInsideWindow"),
             }
         )
-    for capture_path in sorted(recording_root.rglob("*-window-capture.json")):
+    for capture_path in sorted(runtime_dir.rglob("*-window-capture.json")):
         report = read_json(capture_path, {}) or {}
         window_capture_reports.append(
             {
@@ -2465,11 +2803,15 @@ def _record_side_locked(
                 "windowId": report.get("windowId"),
                 "ownerPid": report.get("ownerPid"),
                 "ownerName": report.get("ownerName"),
+                "ownerBundleId": report.get("ownerBundleId"),
+                "ownerApp": report.get("ownerApp"),
                 "windowName": report.get("windowName"),
                 "bounds": report.get("bounds"),
                 "exitCode": report.get("exitCode"),
                 "readyPath": report.get("readyPath"),
                 "logPath": report.get("logPath"),
+                "outputPath": report.get("outputPath"),
+                "visualContent": report.get("visualContent"),
             }
         )
     chrome_profile_cleanup = read_json(runtime_dir / "chrome-profile-cleanup.json", {}) or {}
@@ -2571,6 +2913,7 @@ def record_side(
     draft = read_json(plan_path, {})
     if "<" in str(draft.get("startCommand") or "") or "TODO" in str(draft.get("startCommand") or ""):
         raise SologsbError(f"请先完善录制脚本: {plan_path}")
+    assert_visible_commands_safe(draft)
     _run_recording_preflight(task_root, side, draft, key="buildCommands", stage="build")
     with global_recording_lock(task_root, side=side, timeout=lock_timeout) as lock_metadata:
         # The lock wait can be long; saving the pre-wait snapshot later would

@@ -25,7 +25,7 @@ FIELDS: dict[str, tuple[str | None, str]] = {
     "claude.apiKey": ("SOLOSB_CLAUDE_KEY", ""),
     "claude.baseUrl": ("SOLOSB_ANTHROPIC_BASE_URL", ""),
     "claude.model": ("SOLOSB_MODEL", "auto_model/urm"),
-    "claude.image": ("SOLOSB_DOCKER_IMAGE", "adminfather/benzhi-claude-code:20260916-toolchains-v2"),
+    "claude.image": ("SOLOSB_DOCKER_IMAGE", "adminfather/benzhi-claude-code2:20260919"),
     "claude.contextWindow": ("SOLOSB_CONTEXT_WINDOW", "1000000"),
     # 容器上限由 side_runner 动态优先读取本字段；环境变量仅作为字段缺失时的回退。
     "claude.maxContainers": ("SOLOSB_MAX_CONTAINERS", "4"),
@@ -44,8 +44,8 @@ FIELDS: dict[str, tuple[str | None, str]] = {
     "solo2.keychainService": ("SOLOSB_SOLO2_KEYCHAIN_SERVICE", ""),
     "github.token": ("GITHUB_TOKEN", ""),
     "github.username": ("SOLOSB_GITHUB_USERNAME", ""),
-    "github.proxyHttp": ("SOLOSB_GITHUB_PROXY", "127.0.0.1:17890"),
-    "github.proxySocks": (None, "127.0.0.1:17891"),
+    "github.proxyHttp": ("SOLOSB_GITHUB_PROXY", "127.0.0.1:7897"),
+    "github.proxySocks": (None, "127.0.0.1:7897"),
 }
 
 # 这些字段在 show / 日志里必须脱敏
@@ -164,6 +164,18 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def proxy_url(value: str, *, default_scheme: str = "http") -> str:
+    """Normalize a bare port or host:port into a proxy URL."""
+    text = _text(value)
+    if not text:
+        return ""
+    if "://" not in text:
+        if text.isdigit():
+            text = f"127.0.0.1:{text}"
+        text = f"{default_scheme}://{text}"
+    return text
+
+
 def resolve(dotted: str, *, cli: Any = None, path: Path | None = None) -> str:
     """按 命令行 > 环境变量 > 配置文件 > 默认值 解析一个字符串配置项。"""
     if cli is not None and _text(cli):
@@ -262,6 +274,10 @@ def _parse_cookies(headers: dict, payload: dict | None = None) -> tuple[str, str
                 csrf = value
     if not csrf and isinstance(payload, dict):
         csrf = str(payload.get("csrf_token") or "").strip()
+    # 登录响应可能分多个 Set-Cookie 头返回 session 与 csrf；
+    # 某些 HTTP 客户端只保留最后一个头，因此用响应体里的 token 补齐 cookie。
+    if csrf and not any(pair.startswith("solo_qa_csrf=") for pair in pairs):
+        pairs.append(f"solo_qa_csrf={csrf}")
     return "; ".join(pairs), csrf
 
 
@@ -279,16 +295,28 @@ def refresh_solo2_session(path: Path | None = None, *, write_back: bool = True) 
     if not base_url or not username or not password:
         raise ConfigError("配置里缺少 solo2.baseUrl / solo2.username / solo2.password，无法自动登录")
 
-    status, payload, headers = _post_json(
+    import requests
+
+    response = requests.post(
         f"{base_url}/api/v1/auth/login",
-        {"username": username, "password": password},
-        headers={"Origin": base_url},
+        json={"username": username, "password": password},
+        headers={"Origin": base_url, "Accept": "application/json"},
+        timeout=30,
     )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    status = response.status_code
     if status != 200:
-        detail = payload.get("detail") or payload.get("message") or str(payload)[:160]
+        detail = payload.get("detail") or payload.get("message") or response.text[:160]
         raise ConfigError(f"SOLO2 登录失败：HTTP {status} {detail}")
 
-    cookie, csrf = _parse_cookies(headers, payload)
+    cookie_map = response.cookies.get_dict()
+    csrf = str(payload.get("csrf_token") or cookie_map.get("solo_qa_csrf") or "").strip()
+    if csrf and not cookie_map.get("solo_qa_csrf"):
+        cookie_map["solo_qa_csrf"] = csrf
+    cookie = "; ".join(f"{name}={value}" for name, value in cookie_map.items())
     if not cookie:
         raise ConfigError("SOLO2 登录成功但响应没有 Set-Cookie，无法保存会话")
 
@@ -361,8 +389,8 @@ def apply_to_env(*, override: bool = False, path: Path | None = None,
         if not value:
             applied[env_name] = "skipped"
             continue
-        if dotted == "github.proxyHttp" and "://" not in value:
-            value = f"http://{value}"
+        if dotted == "github.proxyHttp":
+            value = proxy_url(value)
         if _text(os.environ.get(env_name)) and not override:
             applied[env_name] = "kept"
             continue
